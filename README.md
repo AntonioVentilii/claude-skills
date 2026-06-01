@@ -14,7 +14,7 @@ into `~/.claude/skills/` so Claude Code loads it locally.
 ## Install on a machine (or after a fresh clone)
 
 ```bash
-git clone git@github.com:AntonioVentilii/claude-skills.git ~/projects/claude-skills
+git clone https://github.com/AntonioVentilii/claude-skills.git ~/projects/claude-skills
 mkdir -p ~/.claude/skills
 # symlink each skill into the user skills dir:
 ln -s ~/projects/claude-skills/prototype-to-app-port ~/.claude/skills/prototype-to-app-port
