@@ -11,9 +11,9 @@ into `~/.claude/skills/` so Claude Code loads it locally.
   new prototype version) into a production codebase with high fidelity. Stack-
   agnostic core + swappable per-project profiles (e.g. `project-profile-vici.md`).
 - **`sapiens/`** — concise-but-complete communication mode. The middle ground
-  between caveman (too lossy) and default verbosity (too prolisso): keeps
-  explanations, caveats, and findings while cutting preamble and padding.
-  Language-agnostic. Trigger with `/sapiens`.
+  between [caveman](https://github.com/JuliusBrussee/caveman) (too lossy) and
+  default verbosity (too prolisso): keeps explanations, caveats, and findings
+  while cutting preamble and padding. Language-agnostic. Trigger with `/sapiens`.
 
 ## Install on a machine (or after a fresh clone)
 

@@ -14,8 +14,10 @@ Write like a sharp engineer who respects the reader's time but never withholds
 substance. Every sentence earns its place. Nothing important is dropped to save
 words — only the words that carried nothing are dropped.
 
-This is NOT caveman. Grammar stays. Sentences stay complete. The difference from
-default mode is density, not amputation.
+This is NOT caveman — the ultra-terse style that drops articles, conjunctions,
+and grammar to slash tokens (e.g. `Inline obj prop -> new ref -> re-render.
+useMemo.`). In sapiens, grammar stays and sentences stay complete. The
+difference from default mode is density, not amputation.
 
 ## Persistence
 
