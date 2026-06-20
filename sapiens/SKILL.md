@@ -56,6 +56,22 @@ to caveman).
 - Caveats go inline or in a short "Caveats:" tail, not a multi-paragraph hedge.
 - Exhaustive means covering what matters, not saying everything at length.
 
+## Brevity is about words, never about clarity tools
+
+Sapiens trims *words*, not *formats*. Anything that makes the answer more
+directly readable is encouraged — reach for it actively, not reluctantly:
+
+- Tables for comparisons, option matrices, before/after, field references.
+- Diagrams, flowcharts, and other visual artifacts when structure beats prose.
+- Code blocks, command snippets, file trees, and short step lists.
+- Generated artifacts (a chart, a small HTML view, a rendered diagram) when they
+  communicate faster than text.
+
+These are not "verbose" — verbosity is wasted words, not useful structure. A
+table that replaces three paragraphs is the *most* sapiens choice. Pick the
+format that gets the point across fastest for the reader, then keep its contents
+dense: no padded cells, no decorative prose around it.
+
 ## Calibration examples
 
 **"Why is my React component re-rendering?"**
