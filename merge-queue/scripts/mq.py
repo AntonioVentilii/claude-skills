@@ -60,6 +60,10 @@ DEFAULTS: dict = {
     # human-equivalent answer to a Copilot review (e.g. an agent posting for you).
     "addressing_bots": ["claude"],
     "wait_timeout_minutes": 45,
+    # Merge directly once everything is green (default). true = use GitHub
+    # auto-merge (`gh pr merge --auto`) where the repo allows it. Opt-in only:
+    # many users forbid --auto in their own instructions.
+    "auto_merge": False,
 }
 
 COPILOT_RE = re.compile(r"^(copilot-pull-request-reviewer(\[bot\])?|copilot)$", re.I)
@@ -263,6 +267,8 @@ def fetch_rules(repo: str, base: str) -> dict:
         rules["thread_resolution"] |= bool((prot.get("required_conversation_resolution") or {}).get("enabled"))
         rules["linear_history"] |= bool((prot.get("required_linear_history") or {}).get("enabled"))
     rules["required_checks"] = sorted({c for c in rules["required_checks"] if c})
+    if rules["allowed_methods"] is not None:
+        rules["allowed_methods"] = sorted(rules["allowed_methods"])  # JSON-safe
     return rules
 
 
@@ -515,7 +521,12 @@ def eval_approvals(pr: dict, rules: dict) -> dict:
         return {"ok": False, "detail": ", ".join(bits) + " (you cannot approve your own PR)"}
     if decision == "APPROVED":
         return {"ok": True, "detail": "approved by " + ", ".join("@" + a for a in approvers) if approvers else "approved"}
-    return {"ok": True, "detail": "no approval required" + (f" ({len(approvers)} approval(s) anyway)" if approvers else "")}
+    detail = "GitHub requires no approval for this PR"
+    if rules.get("code_owner_review"):
+        detail += " (the code-owner rule exists but doesn't apply here, e.g. you own the files changed)"
+    if approvers:
+        detail += f"; {len(approvers)} approval(s) anyway"
+    return {"ok": True, "detail": detail}
 
 
 def evaluate_pr(pr: dict, ctx: dict) -> dict:
@@ -696,6 +707,20 @@ def cmd_status(a) -> int:
     if not a.pr:
         results.sort(key=lambda r: r["number"])
 
+    # Stacked PRs: a queued PR whose head branch is the base of other open PRs.
+    # Merging it makes GitHub retarget them to the default branch (when the
+    # head branch is deleted on merge), carrying its original commits.
+    by_base: dict[str, list[int]] = {}
+    for pr in prs:
+        by_base.setdefault(pr.get("baseRefName") or "", []).append(pr["number"])
+    for r in results:
+        deps = sorted(n for n in by_base.get(r["head"] or "", []) if n != r["number"])
+        if r["next"] != "excluded" and deps:
+            r["dependents"] = deps
+            r["warnings"].append(
+                "base of open PR(s) " + ", ".join(f"#{n}" for n in deps) + ": merging it retargets them to "
+                f"`{base}` (if its branch is deleted on merge) with its original commits; they are NOT part of this run")
+
     method, method_note = choose_method(meta, rules, cfg.get("method", "squash"))
     perm = meta.get("viewerPermission")
     notes = []
@@ -703,16 +728,18 @@ def cmd_status(a) -> int:
         notes.append(f"viewer permission is {perm}: you cannot update or merge here")
     if rules.get("merge_queue"):
         notes.append("this branch has a native GitHub merge queue: `gh pr merge --auto` will enqueue instead of merging")
-    if not meta.get("autoMergeAllowed"):
-        notes.append("auto-merge is not enabled/available in this repo: merge directly once everything is green")
+    auto = bool(cfg.get("auto_merge")) and bool(meta.get("autoMergeAllowed"))
+    if cfg.get("auto_merge") and not meta.get("autoMergeAllowed"):
+        notes.append("auto_merge is on in the config but not available in this repo: merging directly")
 
     out = {
         "repo": repo, "viewer": viewer, "base": base, "private": meta.get("isPrivate"),
         "permission": perm, "auto_merge_allowed": meta.get("autoMergeAllowed"),
+        "merge_mode": "auto" if auto else "direct",
         "delete_branch_on_merge": meta.get("deleteBranchOnMerge"),
         "merge_method": method, "merge_method_note": method_note,
         "copilot_mode": cfg.get("copilot"), "repo_uses_copilot": uses if cfg.get("copilot") == "auto" else None,
-        "config": {k: cfg[k] for k in ("author", "copilot", "update", "method", "wait_timeout_minutes")},
+        "config": {k: cfg[k] for k in ("author", "copilot", "update", "method", "wait_timeout_minutes", "auto_merge")},
         "rules": rules, "notes": notes,
         "queue": [r for r in results if r["next"] != "excluded"],
         "excluded": [{"number": r["number"], "title": r["title"], "author": r["author"], "reason": r["excluded"]} for r in results if r["next"] == "excluded"],
@@ -722,13 +749,13 @@ def cmd_status(a) -> int:
     elif a.format == "brief":
         print_brief(out)
     else:
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out, indent=2, default=lambda o: sorted(o) if isinstance(o, (set, frozenset)) else str(o)))
     return 0
 
 
 def print_table(out: dict) -> None:
     print(f"# {out['repo']} -> {out['base']}  (viewer @{out['viewer']}, perm {out['permission']}, method {out['merge_method_note']})")
-    print(f"# copilot={out['copilot_mode']} uses={out['repo_uses_copilot']}  update={out['config']['update']}  author={out['config']['author']}  auto-merge={out['auto_merge_allowed']}")
+    print(f"# copilot={out['copilot_mode']} uses={out['repo_uses_copilot']}  update={out['config']['update']}  author={out['config']['author']}  merge={out['merge_mode']}")
     for n in out["notes"]:
         print(f"# NOTE: {n}")
     print()
@@ -751,6 +778,27 @@ def print_table(out: dict) -> None:
         print("\nExcluded:")
         for e in out["excluded"]:
             print(f"  #{e['number']} {e['title']} - {e['reason']}")
+
+
+COLOR = {"green": "🟢", "blue": "🔵", "yellow": "🟡", "none": "no verdict"}
+
+
+def why_text(r: dict) -> str:
+    """Why column: always show the Copilot verdict and CI state, then problems."""
+    g = r.get("gates", {})
+    bits = []
+    cp = g.get("copilot")
+    if cp and cp.get("status") != "n/a":
+        bits.append(f"Copilot {COLOR.get(cp.get('verdict') or '', '')} {cp['detail']}".replace("  ", " "))
+    ck = g.get("checks")
+    if ck:
+        bits.append({"success": f"{ck['passed']} check(s) green", "none": "no CI",
+                     "pending": "CI running", "failure": "CI failing"}.get(ck["state"], ck["state"]))
+    behind = (g.get("up_to_date") or {}).get("behind_by")
+    if behind:
+        bits.append(f"behind by {behind}")
+    bits += r.get("blockers", []) + r.get("warnings", [])
+    return "; ".join(bits) or "all gates pass"
 
 
 NEXT_LABEL = {
@@ -783,13 +831,13 @@ def print_brief(out: dict) -> None:
     print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
     print(f"- **Copilot review:** {copilot}.")
     print(f"- **Before merging:** {update}, then wait for **all** checks to be green.")
-    am = "auto-merge" if out["auto_merge_allowed"] else "a direct merge (auto-merge isn't available in this repo)"
+    am = "GitHub auto-merge" if out.get("merge_mode") == "auto" else "a direct merge once everything is green (no auto-merge)"
     print(f"- **Merge:** {out['merge_method_note']}, via {am}.")
     req = []
     if rules.get("required_approvals"):
         req.append(f"{rules['required_approvals']} approval(s)")
     if rules.get("code_owner_review"):
-        req.append("code-owner approval")
+        req.append("code-owner approval (only when someone else owns the files changed)")
     if rules.get("thread_resolution"):
         req.append("all conversations resolved")
     if rules.get("required_checks"):
@@ -812,10 +860,15 @@ def print_brief(out: dict) -> None:
     print("\n### What will happen")
     print("| PR | Title | Plan | Why |")
     print("|---|---|---|---|")
+    first_go = True
     for r in out["queue"]:
-        why = "; ".join(r["blockers"]) or "; ".join(r["warnings"]) or "all gates pass"
         plan = NEXT_LABEL.get(r["next"], r["next"]).format(base=out["base"])
-        print(f"| [#{r['number']}]({r['url']}) | {r['title']} | {plan} | {why} |")
+        if r["next"] in ("merge", "wait_checks", "update", "confirm"):
+            if not first_go and c["update"] != "none" and r["next"] in ("merge", "wait_checks"):
+                # The PRs before it will have landed: it will be behind by then.
+                plan = f"rebase on {out['base']} (after the PRs above land), wait for CI, merge"
+            first_go = False
+        print(f"| [#{r['number']}]({r['url']}) | {r['title']} | {plan} | {why_text(r)} |")
     for e in out["excluded"]:
         print(f"| #{e['number']} | {e['title']} | not in queue | {e['reason']} |")
     asks = [r for r in out["queue"] if (r["gates"].get("copilot") or {}).get("status") == "confirm"]
@@ -826,7 +879,17 @@ def print_brief(out: dict) -> None:
             print(f"- **#{r['number']}** {g['verdict']} review: {g.get('review_url')}")
             for cand in g.get("candidates", []):
                 print(f"  - comment by @{cand['author']}: {cand['url']}")
-    print("\nReply to go ahead (and, for the reviews above, which ones are resolved).")
+    deps = [r for r in out["queue"] if r.get("dependents")]
+    if deps:
+        print("\n### Stacked PRs")
+        for r in deps:
+            print(f"- Merging #{r['number']} moves " + ", ".join(f"#{n}" for n in r["dependents"])
+                  + f" onto `{out['base']}` (if its branch is deleted on merge), still carrying #{r['number']}'s original"
+                  " commits, which usually means conflicts after a squash. They stay out of this run.")
+    if asks:
+        print("\nReply to go ahead, and say which of the Copilot reviews above are resolved.")
+    else:
+        print("\nReply to go ahead.")
 
 
 def fetch_one(repo: str, number: int) -> dict:

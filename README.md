@@ -18,9 +18,10 @@ into `~/.claude/skills/` so Claude Code loads it locally.
   (personal repos, private repos on Free/Team). PRs into the default branch
   only, oldest-first, one at a time: ready-for-review → Copilot review handled
   (green/blue/yellow; blue ones confirmed with you) → approvals → rebase on
-  main → CI green → auto-merge (squash by default). Shows a briefing and waits
-  for a go-ahead first; skips anything not ready, ignores release PRs, ends
-  with a report. Default: only your PRs. Per-repo defaults in
+  main → CI green → merge (squash, direct by default; auto-merge opt-in).
+  Shows a briefing and waits for a go-ahead first, then touches only the PRs
+  you approved; skips anything not ready, ignores release PRs, ends with a
+  report. Default: only your PRs. Per-repo defaults in
   `merge-queue/config/repos.json`; needs an authenticated `gh`. Trigger with
   `/merge-queue` (`/merge-queue all`, `/merge-queue #12 #15`, `dry run`, …).
 

@@ -284,3 +284,84 @@ class FailClosed(unittest.TestCase):
         self.assertEqual(mq.evaluate_pr(self.ok_pr(labels=many), ctx())["next"], "skip")
         threads = {"totalCount": 120, "nodes": []}
         self.assertEqual(mq.evaluate_pr(self.ok_pr(reviewThreads=threads), ctx())["next"], "skip")
+
+
+class FieldTest(unittest.TestCase):
+    """Regressions from the first live run (AntonioVentilii/neve)."""
+
+    def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None):
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+        meta = {"nameWithOwner": "o/r", "isPrivate": True, "viewerPermission": "ADMIN",
+                "defaultBranchRef": {"name": "main"}, "autoMergeAllowed": True,
+                "squashMergeAllowed": True, "mergeCommitAllowed": True, "rebaseMergeAllowed": True}
+        meta.update(meta_extra or {})
+        rules_payload = rules_payload if rules_payload is not None else [
+            {"type": "pull_request", "parameters": {"required_approving_review_count": 0,
+                                                    "require_code_owner_review": True,
+                                                    "allowed_merge_methods": ["squash", "rebase"]}}]
+
+        def fake_rest(path):
+            if "/rules/branches/" in path:
+                return True, rules_payload
+            return False, "404"
+        cfg = dict(mq.DEFAULTS)
+        cfg.update(cfg_extra or {})
+        a = argparse.Namespace(repo="o/r", pr=pr_args, author=None, copilot=None, update=None, method=None,
+                               confirmed=None, format=fmt)
+        buf = io.StringIO()
+        with mock.patch.object(mq, "fetch_repo", return_value=(meta, prs, "antonio")), \
+                mock.patch.object(mq, "rest", side_effect=fake_rest), \
+                mock.patch.object(mq, "repo_uses_copilot", return_value=True), \
+                mock.patch.object(mq, "behind_by", return_value=0), \
+                mock.patch.object(mq, "load_config", return_value=cfg), \
+                contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.cmd_status(a), 0)
+        return buf.getvalue()
+
+    def queue(self):
+        p100 = pr(number=100, headRefName="av/base", reviews=conn(review(YELLOW)), reviewThreads=conn(thread(True)))
+        p101 = pr(number=101, baseRefName="av/base", headRefName="av/stacked", reviews=conn(review(GREEN)))
+        p105 = pr(number=105, headRefName="av/other", reviews=conn(review(GREEN)))
+        return [p100, p101, p105]
+
+    def test_json_output_with_allowed_merge_methods(self):
+        import json
+        out = json.loads(self.run_status(self.queue()))
+        self.assertEqual(out["rules"]["allowed_methods"], ["rebase", "squash"])
+        self.assertEqual(out["merge_method"], "squash")
+
+    def test_direct_merge_is_default(self):
+        import json
+        out = json.loads(self.run_status(self.queue()))
+        self.assertEqual(out["merge_mode"], "direct")
+        self.assertIn("direct merge", self.run_status(self.queue(), fmt="brief"))
+        out = json.loads(self.run_status(self.queue(), cfg_extra={"auto_merge": True}))
+        self.assertEqual(out["merge_mode"], "auto")
+        out = json.loads(self.run_status(self.queue(), cfg_extra={"auto_merge": True}, meta_extra={"autoMergeAllowed": False}))
+        self.assertEqual(out["merge_mode"], "direct")
+
+    def test_stacked_dependents_flagged(self):
+        import json
+        out = json.loads(self.run_status(self.queue()))
+        q = {r["number"]: r for r in out["queue"]}
+        self.assertEqual(q[100]["dependents"], [101])
+        self.assertIn("#101", " ".join(q[100]["warnings"]))
+        self.assertIn("Stacked PRs", self.run_status(self.queue(), fmt="brief"))
+
+    def test_brief_plan_why_and_closing_line(self):
+        text = self.run_status(self.queue(), fmt="brief")
+        row105 = [l for l in text.splitlines() if l.startswith("| [#105]")][0]
+        self.assertIn("after the PRs above land", row105)
+        row100 = [l for l in text.splitlines() if l.startswith("| [#100]")][0]
+        self.assertIn("🟡", row100)
+        self.assertNotIn("all gates pass", row100)
+        self.assertTrue(text.rstrip().endswith("Reply to go ahead."), text[-200:])
+        self.assertIn("only when someone else owns the files", text)
+
+    def test_code_owner_rule_explained_in_approvals(self):
+        r = mq.eval_approvals(pr(), {"code_owner_review": True})
+        self.assertTrue(r["ok"])
+        self.assertIn("code-owner rule exists but doesn't apply", r["detail"])

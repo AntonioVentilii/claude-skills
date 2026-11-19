@@ -6,8 +6,8 @@ description: >-
   (main/master), oldest first, one at a time: checks the gates (ready for
   review, Copilot review arrived and handled per its green/blue/yellow verdict,
   required approvals, no conflicts, no hold labels), rebases on the default
-  branch, waits for all CI to go green, then merges via auto-merge (squash by
-  default). Any PR failing a gate is skipped with a reason, never fixed.
+  branch, waits for all CI to go green, then merges it directly (squash by
+  default; GitHub auto-merge only if configured). Any PR failing a gate is skipped with a reason, never fixed.
   Release PRs are left out. Before touching anything it shows a schematic
   briefing of what it will do and which rules apply, and waits for a go-ahead.
   Ends with a report. Use when the user says "merge queue", "/merge-queue",
@@ -89,6 +89,19 @@ Also read `notes`. If the viewer has no write permission, stop after the
 briefing. If the branch has a native merge queue, say so (the user may prefer
 it); `gh pr merge --auto` would enqueue there.
 
+**Approved list.** The go-ahead covers exactly the PRs in the briefing's
+queue, nothing else. Write their numbers down (e.g. `APPROVED="100 105 106"`).
+From here on, every `status` call is `status --pr $APPROVED_STILL_OPEN`, so a
+PR that shows up mid-run can never be merged by this run. That includes PRs
+retargeted to the default branch after their base PR merged, or new ones. Such PRs go
+in the report as "appeared during the run, not processed".
+
+**Stacked PRs.** When a queued PR is the base of other open PRs, the briefing
+lists them under "Stacked PRs": merging it makes GitHub retarget them to the
+default branch (when the branch is deleted on merge), still carrying the
+original commits, which usually conflicts after a squash. Say this plainly; the
+user may prefer to merge differently.
+
 **Dry run:** the briefing is the whole output. Make no changes of any kind.
 
 ## 3. The gates (what `mq.py` checks, so you can explain it)
@@ -132,10 +145,10 @@ of guessing.
 
 ## 4. Run the queue
 
-Process `queue` in order. Keep a running log per PR (result + reason) for the
-report. **Re-run `mq.py status --pr N [--confirmed …]` right before acting on
-each PR**, because merging the previous PR moved the base, and act on that fresh
-`next`:
+Process the approved queue in order. Keep a running log per PR (result +
+reason) for the report. **Re-run `mq.py status --pr N [--confirmed …]` right
+before acting on each PR**, because merging the previous PR moved the base, and
+act on that fresh `next`:
 
 - `skip`: record the blockers; go to the next PR.
 - `confirm`: the user didn't confirm this one → record "Copilot review not
@@ -152,9 +165,9 @@ python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
 #    (no --not-sha when there was no update)
 # c. re-verify everything on the final head
 python3 SKILL/scripts/mq.py status --pr N [--confirmed N]
-# d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase);
-#    --auto only when auto_merge_allowed is true, otherwise leave it out
-gh pr merge N [--auto] --<merge_method> --match-head-commit <head_sha>
+# d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase).
+#    Direct merge by default; add --auto only when merge_mode is "auto".
+gh pr merge N --<merge_method> --match-head-commit <head_sha>
 # e. confirm it landed before touching the next PR
 python3 SKILL/scripts/mq.py wait-merged --pr N --timeout-sec 180
 ```
@@ -163,36 +176,48 @@ How to read each step:
 
 - **a.** If `update-branch` fails (conflicts the server can't rebase, fork
   without maintainer edits, or a rule rejects it), skip with that reason. If
-  it says the branch is already up to date, carry on.
+  it says the branch is already up to date, carry on. On success it prints
+  "✓ PR branch updated" and exits 0, but the head SHA changes a few seconds
+  **later**: that's why b passes `--not-sha $OLD`. Never read the checks right
+  after the update without it, or you'd be looking at the old head's CI.
 - **b.** `wait-checks` returns 0 when everything is green, or when no CI
   registered within the settle time; it prints JSON. Exit 1 means CI failed:
   skip, naming the failing checks. Don't re-run them and don't fix them. If
-  the time budget runs out (exit 2) and auto-merge is available, arm it (d)
-  and record "auto-merge armed, CI still running". Otherwise skip with "CI
-  still running after N min".
+  the time budget runs out (exit 2): skip with "CI still running after N min"
+  (in `merge_mode: auto` only, arm auto-merge instead and record "auto-merge
+  armed, CI still running").
 - **c.** It must say `next: merge` again. Things that can change it: a Copilot
   re-review triggered by the rebase may have landed (yellow, new threads, or a
   new blue that needs asking → skip and report it), stale approvals may have
   been dismissed, or the base may have moved again (`update` → back to a; at
   most 3 cycles per PR, then skip as "base keeps moving").
-- **d.** Build the flags from the snapshot: `merge_method` gives `--squash`,
-  `--merge` or `--rebase`. Pass `--auto` only if `auto_merge_allowed` is true;
-  otherwise (common on private repos on Free plans) merge directly, which is
-  fine because everything was just verified green. If `--auto` fails with "clean
-  status" or similar, the PR is already mergeable, so merge directly. Never
-  pass `--admin`. Don't pass `--delete-branch`; the repo's setting decides.
-- **e.** Exit 0 means merged: next PR. Exit 2 means it didn't merge (e.g.
-  waiting on a required check or review GitHub still enforces). Record "armed,
-  waiting on <mergeStateStatus>" and go on.
+- **d.** `merge_method` from the snapshot gives `--squash`, `--merge` or
+  `--rebase`. `--match-head-commit` makes GitHub refuse the merge if the head
+  moved since c. **Default `merge_mode: direct`**: merge now, no `--auto`.
+  Everything was just verified green on this exact head. `--auto` is used only
+  when the config sets `"auto_merge": true` and the snapshot says `merge_mode:
+  auto`. If `--auto` then fails with "clean status", merge directly. Never pass
+  `--admin`. Don't pass `--delete-branch`; the repo's setting decides.
+  A direct `gh pr merge` prints **nothing** and exits 0 on success, so don't
+  read silence as failure (or success): step e is what confirms it.
+- **e.** Exit 0 means merged: next PR. Exit 2 means it didn't merge (e.g. a
+  required check or review GitHub still enforces). Record "not merged, waiting
+  on <mergeStateStatus>" (or "armed" in auto mode) and go on.
 
-**Final sweep (once):** if anything merged and some PRs were skipped only for
-transient reasons (Copilot not arrived yet, CI still running), re-run `status`
-once and process any PR whose `next` is now `update`/`wait_checks`/`merge`. One
-sweep, not a loop. A PR that newly needs `confirm` goes in the report as a
+**Final sweep (once):** if anything merged and some **approved** PRs were
+skipped only for transient reasons (Copilot not arrived yet, CI still running,
+mergeability unknown), re-run `status --pr <those numbers>` once and process any
+whose `next` is now `update`/`wait_checks`/`merge`. Only approved PRs, never
+the whole repo. One sweep, not a loop. A PR that newly needs `confirm` goes in the report as a
 question, not a new prompt mid-run.
 
 ### Hard rules
 
+- **The user's own instructions win.** If their CLAUDE.md or settings forbid
+  something this skill describes (e.g. `gh pr merge --auto`), follow theirs and
+  use the alternative given here (direct merge). Say so in the report.
+- **Only the approved PRs.** Never update or merge a PR that wasn't in the
+  briefing the user said go to, even if it becomes eligible mid-run.
 - **Briefing first.** No change of any kind before the user has seen the
   briefing and said go (unless the invocation already said not to ask).
 - **Gatekeeper, not fixer.** Don't edit code, resolve threads, answer Copilot,
@@ -224,7 +249,7 @@ squash · rebase-update · only @you · Copilot: used · 6 in queue, 2 excluded
 | #14 | fix: y | ❓ not confirmed | 🔵 Copilot [review](url): comment [by @you](url), not confirmed resolved |
 | #15 | chore: z | ⏭ skipped | needs 1 approving review (has 0) |
 | #16 | feat: w | ❌ CI failed | `test (node 20)` failed after rebase ([run](url)) |
-| #17 | feat: v | ⏳ armed | auto-merge on; waiting on required check `e2e` |
+| #17 | feat: v | ⏸ not merged | merge refused: waiting on required check `e2e` |
 | #18 | docs: u | ⏭ skipped | no Copilot review, none requested |
 
 Excluded: #10 `chore(main): release 2.3.0` (release PR) · #11 by @bob (only your PRs) · #13 into `develop` (not the default branch)
@@ -236,8 +261,10 @@ Excluded: #10 `chore(main): release 2.3.0` (release PR) · #11 by @bob (only you
 - #18: request a Copilot review if you want it in the queue.
 ```
 
-Legend: ✅ merged · ⏳ auto-merge armed · ⏭ skipped (gate) · ❌ CI failed ·
-❓ needs your confirmation · 🚫 excluded. Include warnings (e.g. unresolved
+Legend: ✅ merged · ⏸ not merged (⏳ armed, in auto mode) · ⏭ skipped (gate) ·
+❌ CI failed · ❓ needs your confirmation · 🚫 excluded. After the table, list
+anything that changed around the queue during the run (stacked PRs retargeted,
+PRs that appeared, conflicts that appeared) as "not processed". Include warnings (e.g. unresolved
 human threads that aren't enforced) under the PR's row. End by offering the
 follow-ups that only need you (address Copilot comments on #14, fix CI on #16, …)
 as a separate task, and offering to re-run the queue later.
@@ -247,7 +274,8 @@ as a separate task, and offering to re-run the queue later.
 `SKILL/config/repos.json` holds per-repo defaults so the user doesn't repeat
 themselves: e.g. a repo without Copilot (`"copilot": "off"`), one that uses
 merge commits (`"method": "merge"`), one that doesn't need updating
-(`"update": "none"`), extra release patterns, or bots whose comments are shown
+(`"update": "none"`), GitHub auto-merge instead of direct merges
+(`"auto_merge": true`, off by default), extra release patterns, or bots whose comments are shown
 as candidate answers to a Copilot review (`addressing_bots`). When the user
 states a lasting preference for a repo ("in this repo we never use Copilot"),
 offer to save it there.
