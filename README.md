@@ -14,6 +14,13 @@ into `~/.claude/skills/` so Claude Code loads it locally.
   between [caveman](https://github.com/JuliusBrussee/caveman) (too lossy) and
   default verbosity (too prolisso): keeps explanations, caveats, and findings
   while cutting preamble and padding. Language-agnostic. Trigger with `/sapiens`.
+- **`merge-queue/`** — a merge queue for repos without GitHub's native one
+  (personal repos, private repos on Free/Team). Oldest-first, one PR at a time:
+  ready-for-review → Copilot review handled (green/blue/yellow) → approvals →
+  rebase on main → CI green → auto-merge (squash by default). Skips anything
+  not ready, ignores release PRs, ends with a report. Per-repo defaults in
+  `merge-queue/config/repos.json`; needs an authenticated `gh`. Trigger with
+  `/merge-queue` (`/merge-queue all`, `/merge-queue #12 #15`, `dry run`, …).
 
 ## Install on a machine (or after a fresh clone)
 
@@ -22,6 +29,8 @@ git clone https://github.com/AntonioVentilii/claude-skills.git ~/projects/claude
 mkdir -p ~/.claude/skills
 # symlink each skill into the user skills dir:
 ln -s ~/projects/claude-skills/prototype-to-app-port ~/.claude/skills/prototype-to-app-port
+ln -s ~/projects/claude-skills/sapiens ~/.claude/skills/sapiens
+ln -s ~/projects/claude-skills/merge-queue ~/.claude/skills/merge-queue
 ```
 
 Claude Code reads skills from `~/.claude/skills/`. Because each entry is a

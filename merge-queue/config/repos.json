@@ -1,0 +1,17 @@
+{
+  "_doc": "Per-repo overrides for the merge-queue skill. Precedence: built-in defaults < \"*\" < \"owner/*\" < \"owner/repo\" < flags given when invoking. Any key from DEFAULTS in scripts/mq.py can be set. Keys: author (me|all|[logins]), copilot (auto|required|off), update (rebase|merge|none), method (squash|merge|rebase), base, exclude_labels, exclude_title_patterns, release {branches, labels, titles}, addressing_bots, wait_timeout_minutes.",
+  "repos": {
+    "*": {
+      "author": "me",
+      "copilot": "auto",
+      "update": "rebase",
+      "method": "squash"
+    },
+    "_example-owner/_example-repo": {
+      "copilot": "off",
+      "method": "merge",
+      "update": "none",
+      "author": "all"
+    }
+  }
+}
