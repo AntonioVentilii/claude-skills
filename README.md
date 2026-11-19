@@ -15,10 +15,12 @@ into `~/.claude/skills/` so Claude Code loads it locally.
   default verbosity (too prolisso): keeps explanations, caveats, and findings
   while cutting preamble and padding. Language-agnostic. Trigger with `/sapiens`.
 - **`merge-queue/`** — a merge queue for repos without GitHub's native one
-  (personal repos, private repos on Free/Team). Oldest-first, one PR at a time:
-  ready-for-review → Copilot review handled (green/blue/yellow) → approvals →
-  rebase on main → CI green → auto-merge (squash by default). Skips anything
-  not ready, ignores release PRs, ends with a report. Per-repo defaults in
+  (personal repos, private repos on Free/Team). PRs into the default branch
+  only, oldest-first, one at a time: ready-for-review → Copilot review handled
+  (green/blue/yellow; blue ones confirmed with you) → approvals → rebase on
+  main → CI green → auto-merge (squash by default). Shows a briefing and waits
+  for a go-ahead first; skips anything not ready, ignores release PRs, ends
+  with a report. Default: only your PRs. Per-repo defaults in
   `merge-queue/config/repos.json`; needs an authenticated `gh`. Trigger with
   `/merge-queue` (`/merge-queue all`, `/merge-queue #12 #15`, `dry run`, …).
 

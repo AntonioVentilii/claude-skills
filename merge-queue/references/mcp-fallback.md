@@ -15,13 +15,14 @@ can't run here.
 | review threads + resolved state | `pull_request_read` method `get_review_comments` |
 | PR conversation comments (answers to a blue review) | `pull_request_read` method `get_comments` |
 | CI | `pull_request_read` methods `get_check_runs` **and** `get_status` (both: check runs and commit statuses) |
-| request Copilot | `request_copilot_review` |
 | update branch | `update_pull_request_branch` with `expectedHeadSha` |
 | arm auto-merge | `enable_pr_auto_merge` (`mergeMethod`: `SQUASH` / `MERGE` / `REBASE`) |
 | merge directly | `merge_pull_request` with `merge_method` and `expectedHeadSha` |
 
 ## Differences from the `gh` path
 
+- Same hard rules as `SKILL.md`: briefing and go-ahead first, default branch
+  only, never request Copilot, ask the user about blue reviews (with links).
 - **No rebase update.** `update_pull_request_branch` only merges the base into
   the branch. With `update: rebase` (the default), tell the user the update
   will be a merge commit instead, and proceed only if they agree, or use

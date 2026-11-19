@@ -67,8 +67,8 @@ class Verdict(unittest.TestCase):
 
 
 class CopilotGate(unittest.TestCase):
-    def ev(self, p, mode="auto", uses=True):
-        return mq.eval_copilot(p, mode, uses, mq.DEFAULTS)
+    def ev(self, p, mode="auto", uses=True, confirmed=False):
+        return mq.eval_copilot(p, mode, uses, mq.DEFAULTS, confirmed=confirmed)
 
     def test_green_clean(self):
         self.assertEqual(self.ev(pr(reviews=conn(review(GREEN))))["status"], "ok")
@@ -77,10 +77,17 @@ class CopilotGate(unittest.TestCase):
         r = self.ev(pr(reviews=conn(review(GREEN)), reviewThreads=conn(thread(False))))
         self.assertEqual(r["status"], "unhandled")
 
-    def test_blue_needs_answer(self):
+    def test_blue_without_comment_is_unhandled(self):
         self.assertEqual(self.ev(pr(reviews=conn(review(BLUE))))["status"], "unhandled")
-        answered = pr(reviews=conn(review(BLUE)), comments=conn({"author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
-        self.assertEqual(self.ev(answered)["status"], "ok")
+
+    def test_blue_with_comment_asks_user_with_links(self):
+        c = {"url": "https://x/c1", "author": ME, "createdAt": "2026-11-01T11:00:00Z"}
+        p = pr(reviews=conn({**review(BLUE), "url": "https://x/r1"}), comments=conn(c))
+        r = self.ev(p)
+        self.assertEqual(r["status"], "confirm")
+        self.assertEqual(r["review_url"], "https://x/r1")
+        self.assertEqual([x["url"] for x in r["candidates"]], ["https://x/c1"])
+        self.assertEqual(self.ev(p, confirmed=True)["status"], "ok")
 
     def test_blue_answer_before_review_does_not_count(self):
         p = pr(reviews=conn(review(BLUE)), comments=conn({"author": ME, "createdAt": "2026-11-01T09:00:00Z"}))
@@ -90,7 +97,7 @@ class CopilotGate(unittest.TestCase):
         p = pr(reviews=conn(review(BLUE)), comments=conn({"author": CODECOV, "createdAt": "2026-11-01T11:00:00Z"}))
         self.assertEqual(self.ev(p)["status"], "unhandled")
         p = pr(reviews=conn(review(BLUE)), comments=conn({"author": CLAUDE, "createdAt": "2026-11-01T11:00:00Z"}))
-        self.assertEqual(self.ev(p)["status"], "ok")
+        self.assertEqual(self.ev(p)["status"], "confirm")
 
     def test_yellow_threads_must_be_resolved(self):
         p = pr(reviews=conn(review(YELLOW)), reviewThreads=conn(thread(True), thread(False)))
@@ -100,6 +107,13 @@ class CopilotGate(unittest.TestCase):
 
     def test_yellow_without_threads_needs_answer(self):
         self.assertEqual(self.ev(pr(reviews=conn(review(YELLOW))))["status"], "unhandled")
+        p = pr(reviews=conn(review(YELLOW)), comments=conn({"author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+        self.assertEqual(self.ev(p)["status"], "confirm")
+
+    def test_blue_with_unresolved_thread_does_not_ask(self):
+        p = pr(reviews=conn(review(BLUE)), reviewThreads=conn(thread(False)),
+               comments=conn({"author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+        self.assertEqual(self.ev(p)["status"], "unhandled")
 
     def test_latest_review_wins(self):
         p = pr(reviews=conn(review(BLUE, rid="R1"), review(GREEN, at="2026-11-02T10:00:00Z", rid="R2")))
@@ -176,8 +190,22 @@ class Evaluate(unittest.TestCase):
         r = mq.evaluate_pr(pr(reviews=conn(review(GREEN)), labels=conn({"name": "do-not-merge"})), ctx())
         self.assertEqual(r["next"], "skip")
 
-    def test_missing_copilot_requests_it(self):
-        self.assertEqual(mq.evaluate_pr(pr(), ctx())["next"], "request_copilot")
+    def test_missing_copilot_is_reported_not_requested(self):
+        r = mq.evaluate_pr(pr(), ctx())
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("none requested", " ".join(r["blockers"]))
+
+    def test_blue_confirm_flow(self):
+        p = pr(reviews=conn(review(BLUE)), comments=conn({"author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+        self.assertEqual(mq.evaluate_pr(p, ctx())["next"], "confirm")
+        self.assertEqual(mq.evaluate_pr(p, ctx(confirmed={1}))["next"], "merge")
+        # other blockers win: no point asking about a PR that is skipped anyway
+        self.assertEqual(mq.evaluate_pr({**p, "isDraft": True}, ctx())["next"], "skip")
+
+    def test_only_default_branch_even_when_explicit(self):
+        r = mq.evaluate_pr(pr(baseRefName="develop", reviews=conn(review(GREEN))), ctx(explicit=True))
+        self.assertEqual(r["next"], "excluded")
+        self.assertIn("default branch", r["excluded"])
 
 
 class Method(unittest.TestCase):
@@ -202,3 +230,23 @@ class Config(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Brief(unittest.TestCase):
+    def test_renders(self):
+        import contextlib
+        import io
+        p = pr(reviews=conn({**review(BLUE), "url": "https://x/r1"}),
+               comments=conn({"url": "https://x/c1", "author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+        res = mq.evaluate_pr(p, ctx())
+        out = {"repo": "o/r", "viewer": "antonio", "base": "main", "auto_merge_allowed": False,
+               "merge_method_note": "squash (preferred)", "copilot_mode": "auto", "repo_uses_copilot": True,
+               "config": {"author": "me", "update": "rebase"}, "rules": {"required_approvals": 1},
+               "notes": [], "queue": [res], "excluded": [{"number": 2, "title": "chore: release 1.0.0", "reason": "release PR"}]}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mq.print_brief(out)
+        text = buf.getvalue()
+        for needle in ("only PRs opened by you (@antonio)", "default branch `main`", "https://x/r1", "https://x/c1",
+                       "ASK YOU first", "1 approval(s)", "never requested", "not in queue"):
+            self.assertIn(needle, text)

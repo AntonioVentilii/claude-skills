@@ -37,7 +37,6 @@ DEFAULTS: dict = {
     "copilot": "auto",  # "auto" | "required" | "off"
     "update": "rebase",  # "rebase" | "merge" | "none"
     "method": "squash",  # "squash" | "merge" | "rebase"
-    "base": None,  # None -> repository default branch
     "exclude_labels": [
         "do-not-merge", "do not merge", "dont-merge", "wip", "work in progress",
         "hold", "on hold", "on-hold", "blocked", "no-merge-queue",
@@ -128,9 +127,9 @@ labels(first: 30) { nodes { name } }
 mergeable mergeStateStatus reviewDecision
 autoMergeRequest { mergeMethod enabledAt }
 reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on Actor { login } ... on Team { slug } } } }
-reviews(last: 60) { nodes { id author { login __typename } state body submittedAt } }
-comments(last: 60) { nodes { author { login __typename } createdAt } }
-reviewThreads(first: 100) { nodes { isResolved isOutdated comments(first: 30) { nodes { author { login __typename } createdAt pullRequestReview { id } } } } }
+reviews(last: 60) { nodes { id url author { login __typename } state body submittedAt } }
+comments(last: 60) { nodes { url author { login __typename } createdAt } }
+reviewThreads(first: 100) { nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
 commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { nodes {
   __typename
   ... on CheckRun { name status conclusion detailsUrl }
@@ -406,8 +405,14 @@ def checks_summary(pr: dict) -> dict:
     return {"state": state, "failing": failing, "pending": pending, "passed": len(passed), "sha": commit.get("oid")}
 
 
-def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict) -> dict:
-    """Returns {status: ok|pending|missing|unhandled|n/a, verdict, detail}."""
+def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: bool = False) -> dict:
+    """Returns {status: ok|pending|missing|unhandled|confirm|n/a, verdict, detail, ...}.
+
+    `confirm` means: the verdict needs an answer (blue, or yellow without inline
+    threads), and there ARE comments after the review, but whether they really
+    resolve it is a human judgement. The result carries the review link and the
+    candidate comment links so the user can be asked. `confirmed=True` (the user
+    said yes for this PR) turns it into ok."""
     if mode == "off":
         return {"status": "n/a", "verdict": None, "detail": "Copilot gate disabled"}
     expected = mode == "required" or (mode == "auto" and repo_uses)
@@ -417,7 +422,7 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict) -> dict:
         if requested:
             return {"status": "pending", "verdict": None, "detail": "Copilot review requested, not arrived yet"}
         if expected:
-            return {"status": "missing", "verdict": None, "detail": "no Copilot review on this PR (repo normally gets one)"}
+            return {"status": "missing", "verdict": None, "detail": "no Copilot review and none requested (repo normally gets one); request it yourself if you want it"}
         return {"status": "n/a", "verdict": None, "detail": "Copilot not used in this repo"}
     latest = reviews[-1]
     verdict = copilot_verdict(latest.get("body"))
@@ -435,30 +440,35 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict) -> dict:
         (cs[0].get("pullRequestReview") or {}).get("id") == latest.get("id") for _, cs in threads
     )
 
-    def answered_after() -> bool:
-        for c in nodes(pr.get("comments")):
+    # Comments by people (or allow-listed agent bots) posted after the review:
+    # candidates for "someone answered it". Never assumed to be an answer.
+    candidates = []
+    for c in nodes(pr.get("comments")):
+        if is_addressing_author(c.get("author"), cfg) and ts(c.get("createdAt")) > since:
+            candidates.append({"url": c.get("url"), "author": (c.get("author") or {}).get("login"), "at": c.get("createdAt")})
+    for r in nodes(pr.get("reviews")):
+        if is_addressing_author(r.get("author"), cfg) and ts(r.get("submittedAt")) > since and (r.get("body") or "").strip():
+            candidates.append({"url": r.get("url"), "author": (r.get("author") or {}).get("login"), "at": r.get("submittedAt")})
+    for _, cs in threads:
+        for c in cs[1:]:
             if is_addressing_author(c.get("author"), cfg) and ts(c.get("createdAt")) > since:
-                return True
-        for r in nodes(pr.get("reviews")):
-            if is_addressing_author(r.get("author"), cfg) and ts(r.get("submittedAt")) > since and (r.get("body") or "").strip():
-                return True
-        for _, cs in threads:
-            for c in cs[1:]:
-                if is_addressing_author(c.get("author"), cfg) and ts(c.get("createdAt")) > since:
-                    return True
-        return False
+                candidates.append({"url": c.get("url"), "author": (c.get("author") or {}).get("login"), "at": c.get("createdAt")})
+    candidates.sort(key=lambda c: ts(c.get("at")))
 
-    problems = []
-    if unresolved:
-        problems.append(f"{len(unresolved)} unresolved Copilot thread(s)")
-    if verdict == "blue" and not answered_after():
-        problems.append("blue verdict (Needs a closer look) has no answering comment after the review")
-    if verdict == "yellow" and not latest_has_threads and not answered_after():
-        problems.append("yellow verdict (Changes recommended) has no inline threads and no answering comment")
     label = {"green": "green", "blue": "blue", "yellow": "yellow", "none": "no verdict"}[verdict]
-    if problems:
-        return {"status": "unhandled", "verdict": verdict, "detail": f"{label}: " + "; ".join(problems)}
-    return {"status": "ok", "verdict": verdict, "detail": f"{label}, handled"}
+    base = {"verdict": verdict, "review_url": latest.get("url")}
+    if unresolved:
+        return {**base, "status": "unhandled", "detail": f"{label}: {len(unresolved)} unresolved Copilot thread(s)"}
+    needs_answer = verdict == "blue" or (verdict == "yellow" and not latest_has_threads)
+    if needs_answer:
+        what = "blue (Needs a closer look)" if verdict == "blue" else "yellow (Changes recommended) without inline threads"
+        if not candidates:
+            return {**base, "status": "unhandled", "detail": f"{what}: nobody has commented since the review"}
+        if not confirmed:
+            return {**base, "status": "confirm", "candidates": candidates,
+                    "detail": f"{what}: {len(candidates)} comment(s) since the review; ask the user whether it is resolved"}
+        return {**base, "status": "ok", "detail": f"{label}, confirmed resolved by the user"}
+    return {**base, "status": "ok", "detail": f"{label}, handled"}
 
 
 def eval_approvals(pr: dict, rules: dict) -> dict:
@@ -509,7 +519,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         elif isinstance(want, list) and author.lower() not in {w.lower() for w in want}:
             res["excluded"] = f"author @{author} not in filter"
     if not res["excluded"] and pr.get("baseRefName") != ctx["base"]:
-        res["excluded"] = f"targets `{pr.get('baseRefName')}`, not `{ctx['base']}` (stacked PR?)"
+        res["excluded"] = f"targets `{pr.get('baseRefName')}`, not the default branch `{ctx['base']}`"
     if res["excluded"]:
         res["next"] = "excluded"
         return res
@@ -529,7 +539,8 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         res["blockers"].append("draft (not ready for review)")
 
     # ---- 2. Copilot review ----
-    cp = eval_copilot(pr, cfg.get("copilot", "auto"), ctx["repo_uses_copilot"], cfg)
+    cp = eval_copilot(pr, cfg.get("copilot", "auto"), ctx["repo_uses_copilot"], cfg,
+                      confirmed=pr["number"] in ctx.get("confirmed", set()))
     res["gates"]["copilot"] = cp
     if cp["status"] in ("pending", "missing", "unhandled"):
         res["blockers"].append("Copilot: " + cp["detail"])
@@ -569,7 +580,12 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         res["warnings"].append("auto-merge already enabled (" + (pr["autoMergeRequest"].get("mergeMethod") or "?") + ")")
 
     if res["blockers"]:
-        res["next"] = "request_copilot" if cp["status"] == "missing" and len(res["blockers"]) == 1 else "skip"
+        res["next"] = "skip"
+        return res
+    if cp["status"] == "confirm":
+        # Everything else is fine; only the user can say whether the comments
+        # after the blue/yellow review actually resolve it.
+        res["next"] = "confirm"
         return res
 
     behind = ctx.get("behind", {}).get(pr["number"])
@@ -616,7 +632,7 @@ def apply_cli_overrides(cfg: dict, a) -> dict:
     cfg = dict(cfg)
     if a.author:
         cfg["author"] = a.author if a.author in ("me", "all") else [x.strip().lstrip("@") for x in a.author.split(",")]
-    for k in ("copilot", "update", "method", "base"):
+    for k in ("copilot", "update", "method"):
         v = getattr(a, k, None)
         if v:
             cfg[k] = v
@@ -627,15 +643,17 @@ def cmd_status(a) -> int:
     repo = a.repo or current_repo()
     cfg = apply_cli_overrides(load_config(repo), a)
     meta, prs, viewer = fetch_repo(repo, a.pr)
-    base = cfg.get("base") or (meta.get("defaultBranchRef") or {}).get("name") or "main"
+    # Only PRs into the repository's default branch are ever queued (by design).
+    base = (meta.get("defaultBranchRef") or {}).get("name") or "main"
     rules = fetch_rules(repo, base)
     uses = cfg.get("copilot") == "auto" and repo_uses_copilot(repo, prs)
-    ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses, "explicit": bool(a.pr), "behind": {}}
+    ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses,
+           "explicit": bool(a.pr), "behind": {}, "confirmed": set(a.confirmed or [])}
 
     # First pass without behind info, then compute behind only for PRs still in play.
     prelim = [evaluate_pr(pr, ctx) for pr in prs]
     for pr, r in zip(prs, prelim):
-        if r["next"] in ("update", "merge", "wait_checks"):
+        if r["next"] in ("update", "merge", "wait_checks", "confirm"):
             ctx["behind"][pr["number"]] = behind_by(repo, base, pr["headRefOid"])
     results = [evaluate_pr(pr, ctx) for pr in prs]
     if not a.pr:
@@ -664,6 +682,8 @@ def cmd_status(a) -> int:
     }
     if a.format == "table":
         print_table(out)
+    elif a.format == "brief":
+        print_brief(out)
     else:
         print(json.dumps(out, indent=2))
     return 0
@@ -694,6 +714,82 @@ def print_table(out: dict) -> None:
         print("\nExcluded:")
         for e in out["excluded"]:
             print(f"  #{e['number']} {e['title']} - {e['reason']}")
+
+
+NEXT_LABEL = {
+    "update": "rebase on {base}, wait for CI, merge",
+    "wait_checks": "wait for CI, merge",
+    "merge": "merge",
+    "confirm": "ASK YOU first (Copilot), then rebase, CI, merge",
+    "skip": "skip",
+}
+
+
+def print_brief(out: dict) -> None:
+    """Schematic pre-run briefing: what will happen and under which rules.
+    Written in English; the agent presents it in the user's language."""
+    c = out["config"]
+    author = {"me": f"only PRs opened by you (@{out['viewer']})", "all": "PRs by anyone"}.get(
+        c["author"] if isinstance(c["author"], str) else "", None) or "PRs by " + ", ".join("@" + x for x in c["author"])
+    update = {"rebase": f"rebase it on `{out['base']}` (done by GitHub, not locally)",
+              "merge": f"merge `{out['base']}` into it", "none": "do not update it"}[c["update"]]
+    cp_mode = out["copilot_mode"]
+    if cp_mode == "off":
+        copilot = "ignored in this repo"
+    else:
+        used = "required" if cp_mode == "required" else ("used in this repo" if out["repo_uses_copilot"] else "not used in this repo, so not checked")
+        copilot = used
+    rules = out["rules"]
+    print(f"## Merge queue: {out['repo']}\n")
+    print("### Settings")
+    print(f"- **Which PRs:** {author}, targeting the default branch `{out['base']}` only. Release PRs are never touched.")
+    print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
+    print(f"- **Copilot review:** {copilot}.")
+    print(f"- **Before merging:** {update}, then wait for **all** checks to be green.")
+    am = "auto-merge" if out["auto_merge_allowed"] else "a direct merge (auto-merge isn't available in this repo)"
+    print(f"- **Merge:** {out['merge_method_note']}, via {am}.")
+    req = []
+    if rules.get("required_approvals"):
+        req.append(f"{rules['required_approvals']} approval(s)")
+    if rules.get("code_owner_review"):
+        req.append("code-owner approval")
+    if rules.get("thread_resolution"):
+        req.append("all conversations resolved")
+    if rules.get("required_checks"):
+        req.append("required checks: " + ", ".join(rules["required_checks"]))
+    print("- **Branch rules found:** " + ("; ".join(req) if req else "none (nothing enforced by GitHub, the queue's own gates still apply)") + ".")
+    for n in out["notes"]:
+        print(f"- **Note:** {n}")
+    print("\n### Gates (a PR that fails any of them is skipped, never fixed)")
+    print("1. Ready for review: not a draft, no hold/WIP label or title.")
+    if cp_mode != "off" and (cp_mode == "required" or out["repo_uses_copilot"]):
+        print("2. Copilot review has arrived (it's never requested for you) and is handled:")
+        print("   - green: every Copilot thread resolved;")
+        print("   - blue: threads resolved, and **you confirm** that the comments after it resolve it (links below);")
+        print("   - yellow: every Copilot thread resolved (no inline threads: same as blue).")
+    else:
+        print("2. Copilot: not checked.")
+    print("3. Approvals the rules require are there; no outstanding \"changes requested\".")
+    print("4. No merge conflicts.")
+    print("5. After the update, every check is green (a failure is reported, not retried).")
+    print("\n### What will happen")
+    print("| PR | Title | Plan | Why |")
+    print("|---|---|---|---|")
+    for r in out["queue"]:
+        why = "; ".join(r["blockers"]) or "; ".join(r["warnings"]) or "all gates pass"
+        plan = NEXT_LABEL.get(r["next"], r["next"]).format(base=out["base"])
+        print(f"| [#{r['number']}]({r['url']}) | {r['title']} | {plan} | {why} |")
+    for e in out["excluded"]:
+        print(f"| #{e['number']} | {e['title']} | not in queue | {e['reason']} |")
+    asks = [r for r in out["queue"] if (r["gates"].get("copilot") or {}).get("status") == "confirm"]
+    if asks:
+        print("\n### Need your answer: are these Copilot reviews resolved?")
+        for r in asks:
+            g = r["gates"]["copilot"]
+            print(f"- **#{r['number']}** {g['verdict']} review: {g.get('review_url')}")
+            for cand in g.get("candidates", []):
+                print(f"  - comment by @{cand['author']}: {cand['url']}")
+    print("\nReply to go ahead (and, for the reviews above, which ones are resolved).")
 
 
 def fetch_one(repo: str, number: int) -> dict:
@@ -773,8 +869,8 @@ def main(argv=None) -> int:
     s.add_argument("--copilot", choices=["auto", "required", "off"])
     s.add_argument("--update", choices=["rebase", "merge", "none"])
     s.add_argument("--method", choices=["squash", "merge", "rebase"])
-    s.add_argument("--base")
-    s.add_argument("--format", choices=["json", "table"], default="json")
+    s.add_argument("--confirmed", type=int, nargs="*", help="PRs whose blue/yellow Copilot review the user confirmed as resolved")
+    s.add_argument("--format", choices=["json", "table", "brief"], default="json")
     s.set_defaults(fn=cmd_status)
 
     w = sub.add_parser("wait-checks")
