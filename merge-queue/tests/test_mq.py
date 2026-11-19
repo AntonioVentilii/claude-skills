@@ -250,3 +250,37 @@ class Brief(unittest.TestCase):
         for needle in ("only PRs opened by you (@antonio)", "default branch `main`", "https://x/r1", "https://x/c1",
                        "ASK YOU first", "1 approval(s)", "never requested", "not in queue"):
             self.assertIn(needle, text)
+
+
+class FailClosed(unittest.TestCase):
+    def ok_pr(self, **kw):
+        return pr(reviews=conn(review(GREEN)), **kw)
+
+    def test_changes_requested_decision_blocks_without_review_node(self):
+        r = mq.evaluate_pr(self.ok_pr(reviewDecision="CHANGES_REQUESTED"), ctx())
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("changes requested", " ".join(r["blockers"]))
+
+    def test_unknown_mergeable_does_not_pass(self):
+        r = mq.evaluate_pr(self.ok_pr(mergeable="UNKNOWN"), ctx())
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("UNKNOWN", " ".join(r["blockers"]))
+
+    def test_aggregate_state_wins_over_fetched_page(self):
+        commits = conn({"commit": {"oid": "abc", "statusCheckRollup": {"state": "FAILURE", "contexts": {
+            "totalCount": 150, "nodes": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}}})
+        self.assertEqual(mq.checks_summary(pr(commits=commits))["state"], "failure")
+        commits["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "PENDING"
+        self.assertEqual(mq.checks_summary(pr(commits=commits))["state"], "pending")
+
+    def test_missing_required_check_is_pending(self):
+        self.assertEqual(mq.checks_summary(pr(), ["ci", "e2e"])["state"], "pending")
+        r = mq.evaluate_pr(self.ok_pr(), ctx(rules={"required_approvals": 0, "required_checks": ["e2e"]}))
+        self.assertEqual(r["next"], "wait_checks")
+        self.assertEqual(mq.checks_summary(pr(), ["ci"])["state"], "success")
+
+    def test_truncated_labels_or_threads_block(self):
+        many = {"totalCount": 101, "nodes": [{"name": "x"}] * 100}
+        self.assertEqual(mq.evaluate_pr(self.ok_pr(labels=many), ctx())["next"], "skip")
+        threads = {"totalCount": 120, "nodes": []}
+        self.assertEqual(mq.evaluate_pr(self.ok_pr(reviewThreads=threads), ctx())["next"], "skip")

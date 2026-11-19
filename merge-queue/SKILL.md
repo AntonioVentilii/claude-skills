@@ -118,9 +118,17 @@ In order, for each PR. Any failure → `next: skip` with the reason in `blockers
    human blocks too, even if no rule enforces it. Unresolved non-Copilot
    threads block only when the rules require conversation resolution;
    otherwise they become a warning.
-5. **No conflicts** with the default branch.
+5. **No conflicts** with the default branch. Only `MERGEABLE` passes: while
+   GitHub is still computing it (`UNKNOWN`) the script retries a few times,
+   then skips with "re-run shortly".
 6. **Up to date** (`--update rebase` by default): if behind, `next: update`.
-   Then CI must pass on the new head before merging.
+   Then CI must pass on the new head before merging: every check green,
+   GitHub's aggregate check state not worse, and every check the branch rules
+   require actually reported.
+
+The script fails closed: if a PR has more labels or review threads than it can
+read in one go (over 100), it skips the PR and asks for a manual check instead
+of guessing.
 
 ## 4. Run the queue
 
@@ -144,8 +152,9 @@ python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
 #    (no --not-sha when there was no update)
 # c. re-verify everything on the final head
 python3 SKILL/scripts/mq.py status --pr N [--confirmed N]
-# d. merge (method from the snapshot's merge_method)
-gh pr merge N --auto --squash --match-head-commit <head_sha>
+# d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase);
+#    --auto only when auto_merge_allowed is true, otherwise leave it out
+gh pr merge N [--auto] --<merge_method> --match-head-commit <head_sha>
 # e. confirm it landed before touching the next PR
 python3 SKILL/scripts/mq.py wait-merged --pr N --timeout-sec 180
 ```
@@ -166,8 +175,9 @@ How to read each step:
   new blue that needs asking → skip and report it), stale approvals may have
   been dismissed, or the base may have moved again (`update` → back to a; at
   most 3 cycles per PR, then skip as "base keeps moving").
-- **d.** Use the snapshot's method. If `auto_merge_allowed` is false (common
-  on private repos on Free plans), drop `--auto` and merge directly, which is
+- **d.** Build the flags from the snapshot: `merge_method` gives `--squash`,
+  `--merge` or `--rebase`. Pass `--auto` only if `auto_merge_allowed` is true;
+  otherwise (common on private repos on Free plans) merge directly, which is
   fine because everything was just verified green. If `--auto` fails with "clean
   status" or similar, the PR is already mergeable, so merge directly. Never
   pass `--admin`. Don't pass `--delete-branch`; the repo's setting decides.

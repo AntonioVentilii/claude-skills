@@ -123,14 +123,14 @@ number title url isDraft createdAt state merged
 author { login __typename }
 baseRefName headRefName headRefOid
 isCrossRepository maintainerCanModify
-labels(first: 30) { nodes { name } }
+labels(first: 100) { totalCount nodes { name } }
 mergeable mergeStateStatus reviewDecision
 autoMergeRequest { mergeMethod enabledAt }
 reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on Actor { login } ... on Team { slug } } } }
-reviews(last: 60) { nodes { id url author { login __typename } state body submittedAt } }
-comments(last: 60) { nodes { url author { login __typename } createdAt } }
-reviewThreads(first: 100) { nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
-commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { nodes {
+reviews(last: 100) { totalCount nodes { id url author { login __typename } state body submittedAt } }
+comments(last: 100) { nodes { url author { login __typename } createdAt } }
+reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
+commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { totalCount nodes {
   __typename
   ... on CheckRun { name status conclusion detailsUrl }
   ... on StatusContext { context state targetUrl }
@@ -314,6 +314,13 @@ def nodes(conn) -> list:
     return [n for n in conn.get("nodes", []) if n]
 
 
+def truncated(conn) -> bool:
+    """True when a connection has more items than we fetched (fail closed)."""
+    if not conn or conn.get("totalCount") is None:
+        return False
+    return conn["totalCount"] > len(conn.get("nodes") or [])
+
+
 def ts(s: str | None) -> datetime:
     if not s:
         return datetime.min.replace(tzinfo=timezone.utc)
@@ -367,7 +374,7 @@ def is_release_pr(pr: dict, cfg: dict) -> str | None:
     return None
 
 
-def checks_summary(pr: dict) -> dict:
+def checks_summary(pr: dict, required: list[str] | None = None) -> dict:
     commits = nodes(pr.get("commits"))
     commit = commits[-1]["commit"] if commits else {}
     rollup = commit.get("statusCheckRollup") or {}
@@ -394,6 +401,19 @@ def checks_summary(pr: dict) -> dict:
                 pending.append(name)
             else:
                 failing.append(name)
+    # GitHub's aggregate state covers every context, including any beyond the
+    # page we fetched: never report better than it.
+    agg = rollup.get("state")
+    if agg in ("FAILURE", "ERROR") and not failing:
+        failing.append(f"(aggregate state {agg}; failing check not in fetched page)")
+    if agg in ("PENDING", "EXPECTED") and not pending and not failing:
+        pending.append(f"(aggregate state {agg})")
+    if truncated(rollup.get("contexts")) and not failing and not pending and agg != "SUCCESS":
+        pending.append("(more than 100 checks; aggregate state not SUCCESS)")
+    present = set(latest)
+    for req in required or []:
+        if req not in present:
+            pending.append(f"{req} (required, not reported yet)")
     if failing:
         state = "failure"
     elif pending:
@@ -486,6 +506,8 @@ def eval_approvals(pr: dict, rules: dict) -> dict:
     if blockers:
         enforced = decision == "CHANGES_REQUESTED"
         return {"ok": False, "detail": "changes requested by " + ", ".join("@" + b for b in blockers) + ("" if enforced else " (not enforced by rules, still outstanding)")}
+    if decision == "CHANGES_REQUESTED":
+        return {"ok": False, "detail": "GitHub reports changes requested (reviewer not in the fetched reviews)"}
     if decision == "REVIEW_REQUIRED":
         bits = [f"requires {need} approving review(s)" if need else "requires approving review(s)", f"has {len(approvers)}"]
         if rules.get("code_owner_review"):
@@ -524,6 +546,12 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         res["next"] = "excluded"
         return res
 
+    if truncated(pr.get("labels")):
+        res["blockers"].append("more than 100 labels: cannot check hold labels safely, check manually")
+    if truncated(pr.get("reviewThreads")):
+        res["blockers"].append("more than 100 review threads: cannot check them safely, check manually")
+    if truncated(pr.get("reviews")):
+        res["warnings"].append("more than 100 reviews: only the latest 100 were read (GitHub's review decision still applies)")
     labels = {l["name"].lower() for l in nodes(pr.get("labels"))}
     hold = sorted(labels & {x.lower() for x in cfg.get("exclude_labels", [])})
     if hold:
@@ -566,14 +594,16 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
 
     # ---- conflicts ----
     mergeable = pr.get("mergeable")
-    res["gates"]["mergeable"] = {"ok": mergeable != "CONFLICTING", "detail": mergeable}
+    res["gates"]["mergeable"] = {"ok": mergeable == "MERGEABLE", "detail": mergeable}
     if mergeable == "CONFLICTING":
         res["blockers"].append("merge conflicts with base - needs manual resolution")
+    elif mergeable != "MERGEABLE":
+        res["blockers"].append(f"mergeability is {mergeable or 'unknown'} (GitHub still computing it) - re-run shortly")
     if pr.get("isCrossRepository") and not pr.get("maintainerCanModify") and cfg.get("update") != "none":
         res["warnings"].append("fork PR without maintainer edits: cannot update branch")
 
     # ---- CI (informational at triage; re-checked after update) ----
-    ck = checks_summary(pr)
+    ck = checks_summary(pr, rules.get("required_checks"))
     res["gates"]["checks"] = ck
 
     if pr.get("autoMergeRequest"):
@@ -646,6 +676,13 @@ def cmd_status(a) -> int:
     # Only PRs into the repository's default branch are ever queued (by design).
     base = (meta.get("defaultBranchRef") or {}).get("name") or "main"
     rules = fetch_rules(repo, base)
+    # GitHub computes mergeability lazily: the first read is often UNKNOWN.
+    for i, pr in enumerate(prs):
+        for delay in (2, 4, 6):
+            if pr.get("mergeable") != "UNKNOWN" or pr.get("baseRefName") != base:
+                break
+            time.sleep(delay)
+            pr = prs[i] = fetch_one(repo, pr["number"])
     uses = cfg.get("copilot") == "auto" and repo_uses_copilot(repo, prs)
     ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses,
            "explicit": bool(a.pr), "behind": {}, "confirmed": set(a.confirmed or [])}
@@ -806,6 +843,8 @@ def cmd_wait_checks(a) -> int:
     deadline = time.time() + a.timeout_sec
     first_seen_new_head = None
     last = None
+    first = fetch_one(repo, a.pr[0])
+    required = fetch_rules(repo, first.get("baseRefName") or "main").get("required_checks")
     while True:
         pr = fetch_one(repo, a.pr[0])
         sha = pr.get("headRefOid")
@@ -814,7 +853,7 @@ def cmd_wait_checks(a) -> int:
             last = {"result": "pending", "reason": "waiting for the updated head commit", "head": sha}
         else:
             first_seen_new_head = first_seen_new_head or time.time()
-            ck = checks_summary(pr)
+            ck = checks_summary(pr, required)
             last = {"result": ck["state"], "head": sha, "failing": ck["failing"], "pending": ck["pending"], "passed": ck["passed"]}
             if ck["state"] == "failure":
                 print(json.dumps(last))
@@ -822,7 +861,7 @@ def cmd_wait_checks(a) -> int:
             if ck["state"] == "success" and time.time() - first_seen_new_head >= min(a.settle_sec, 30):
                 # Short settle so late-registering workflows get a chance to appear.
                 pr2 = fetch_one(repo, a.pr[0])
-                ck2 = checks_summary(pr2)
+                ck2 = checks_summary(pr2, required)
                 if ck2["state"] == "success" and pr2.get("headRefOid") == sha:
                     last.update(passed=ck2["passed"])
                     print(json.dumps(last))
