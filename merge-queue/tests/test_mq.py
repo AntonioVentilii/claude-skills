@@ -290,7 +290,8 @@ class FieldTest(unittest.TestCase):
     """Regressions from the first live run (AntonioVentilii/neve)."""
 
     def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None,
-                   approved_heads=None, compare=None, open_bases=None, base_commits=("b", "m652")):
+                   approved_heads=None, compare=None, open_bases=None, base_commits=("b", "m652"),
+                   merge_checker=None):
         import argparse
         import contextlib
         import io
@@ -324,6 +325,7 @@ class FieldTest(unittest.TestCase):
         bases = open_bases if open_bases is not None else [(p_["number"], p_.get("baseRefName")) for p_ in prs]
         with mock.patch.object(mq, "fetch_repo", return_value=(meta, prs, "antonio")), \
                 mock.patch.object(mq, "open_pr_bases", return_value=bases), \
+                mock.patch.object(mq, "make_merge_checker", return_value=merge_checker), \
                 mock.patch.object(mq, "rest", side_effect=fake_rest), \
                 mock.patch.object(mq, "repo_uses_copilot", return_value=True), \
                 mock.patch.object(mq, "behind_by", return_value=0), \
@@ -538,7 +540,7 @@ class ThirdRun(unittest.TestCase):
         r = out["queue"][0]
         self.assertEqual(r["head_changed"]["kind"], "merges_only")
         self.assertNotEqual(r["next"], "skip")
-        self.assertIn("head changed since the briefing", " ".join(r["warnings"]))
+        self.assertIn("pushed to it during the run", " ".join(r["warnings"]))
         # new work nobody approved: skip
         out = json.loads(self.run_status(p, pr_args=[108], approved_heads=["108=64ad16b"],
                                          compare={"status": "ahead", "commits": [plain_commit("feat: more")]}))
@@ -767,3 +769,107 @@ class SeventhRun(unittest.TestCase):
         payload = [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "ci"}]}}]
         text = self.run_status([pr(reviews=conn(review(GREEN)))], fmt="brief", rules_payload=payload)
         self.assertIn("1 check(s) green (required: ci)", text)
+
+
+
+def git_repo_with_merges():
+    """A real repo: main + feature, and three merges of main into feature:
+    clean, conflict resolved by hand, and clean-but-edited."""
+    import subprocess, tempfile
+    d = tempfile.mkdtemp()
+
+    def g(*a):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main",
+                               *a], cwd=d, capture_output=True, text=True, check=True).stdout.strip()
+
+    def write(name, text):
+        with open(os.path.join(d, name), "w") as f:
+            f.write(text)
+    g("init", "-q")
+    write("a.txt", "one\n"); write("b.txt", "x\n")
+    g("add", "."); g("commit", "-qm", "base")
+    g("checkout", "-qb", "feature")
+    write("b.txt", "feature\n"); g("commit", "-qam", "feature work")
+    g("checkout", "-q", "main")
+    write("a.txt", "two\n"); g("commit", "-qam", "main moves")
+    g("checkout", "-q", "feature")
+    g("merge", "-q", "--no-edit", "main")
+    clean = g("rev-parse", "HEAD")
+    g("checkout", "-q", "main")
+    write("b.txt", "main\n"); g("commit", "-qam", "main touches b")
+    g("checkout", "-q", "feature")
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "main"], cwd=d, capture_output=True)
+    write("b.txt", "resolved by hand\n"); g("add", "b.txt"); g("commit", "-qm", "Merge origin/main into feature")
+    resolved = g("rev-parse", "HEAD")
+    g("checkout", "-q", "main")
+    write("a.txt", "three\n"); g("commit", "-qam", "main again")
+    g("checkout", "-q", "feature")
+    g("merge", "-q", "--no-commit", "main")
+    write("c.txt", "sneaked in\n"); g("add", "c.txt"); g("commit", "-qm", "Merge branch 'main' into feature")
+    edited = g("rev-parse", "HEAD")
+    parents = lambda sha: g("rev-list", "--parents", "-n1", sha).split()[1:]
+    return d, {"clean": (clean, parents(clean)), "resolved": (resolved, parents(resolved)),
+               "edited": (edited, parents(edited))}
+
+
+class EighthRun(unittest.TestCase):
+    """Eighth live run (uliveto): 2 merged, 1 skipped on a real conflict."""
+
+    run_status = FieldTest.run_status
+
+    def test_merge_check_on_a_real_repo(self):
+        d, m = git_repo_with_merges()
+        for kind, (sha, parents) in m.items():
+            self.assertEqual(mq.merge_check(sha, parents, cwd=d), kind, kind)
+        self.assertIsNone(mq.merge_check("0" * 40, ["1" * 40, "2" * 40], cwd=d))  # unknown objects
+
+    def test_hand_resolved_merge_mid_run_is_new_code(self):
+        cmp_ = {"status": "ahead", "commits": [{"sha": "r1", "parents": [{"sha": "f"}, {"sha": "m"}],
+                                                "commit": {"message": "Merge origin/main into feature"}}]}
+        in_base = lambda sha: sha == "m"
+        self.assertEqual(mq.classify_head_change(cmp_, "main", in_base, merge_checker=lambda s, p: "clean")["kind"],
+                         "merges_only")
+        ch = mq.classify_head_change(cmp_, "main", in_base, merge_checker=lambda s, p: "resolved")
+        self.assertEqual(ch["kind"], "new_commits")
+        self.assertIn("conflicts resolved by hand", ch["commits"][0])
+        ch = mq.classify_head_change(cmp_, "main", in_base, merge_checker=lambda s, p: None)
+        self.assertEqual(ch, {"kind": "merges_only", "count": 1, "unchecked_merges": 1})
+
+    def test_hand_resolved_merge_after_copilot_review_is_flagged(self):
+        commits = {"totalCount": 2, "nodes": [
+            {"commit": {"oid": "c1", "parents": {"totalCount": 1, "nodes": [{"oid": "c0"}]}}},
+            {"commit": {"oid": "r1", "parents": {"totalCount": 2, "nodes": [{"oid": "c1"}, {"oid": "m"}]}}}]}
+        ar = mq.commits_after_review(pr(prCommits=commits), "c1", merge_checker=lambda s, p: "resolved")
+        self.assertEqual(ar, {"commits": 1, "merges": 1, "hand_merges": 1})
+        self.assertIn("conflicts resolved by hand", mq.after_review_text(ar))
+
+    def test_shared_files_warned_in_briefing(self):
+        f = lambda *ps: {"totalCount": len(ps), "nodes": [{"path": x} for x in ps]}
+        p = [pr(number=659, reviews=conn(review(GREEN)), files=f("app/page.tsx", "docs/ai/reusability.md", "a.ts")),
+             pr(number=665, reviews=conn(review(GREEN)), files=f("app/page.tsx", "docs/ai/reusability.md", "b.ts")),
+             pr(number=666, reviews=conn(review(GREEN)), files=f("c.ts"))]
+        import json
+        out = json.loads(self.run_status(p))
+        q = {r["number"]: r for r in out["queue"]}
+        self.assertEqual(q[665]["overlaps"], {"659": ["app/page.tsx", "docs/ai/reusability.md"]})
+        self.assertNotIn("overlaps", q[666])
+        text = self.run_status(p, fmt="brief")
+        self.assertIn("#665 and #659 both change `app/page.tsx`, `docs/ai/reusability.md`", text)
+
+    def test_retargeted_pr_explains_missing_copilot(self):
+        moved = conn({"createdAt": "2026-11-20T10:00:00Z", "previousRefName": "av/base", "currentRefName": "main"})
+        cp = mq.eval_copilot(pr(timelineItems=moved), "auto", True, mq.DEFAULTS)
+        self.assertEqual(cp["status"], "missing")
+        self.assertIn("opened against `av/base` and moved to `main`", cp["detail"])
+
+    def test_up_to_date_gate_always_in_json(self):
+        import json
+        out = json.loads(self.run_status([pr(number=663), pr(number=1, reviews=conn(review(GREEN)))]))
+        self.assertTrue(all("up_to_date" in r["gates"] for r in out["queue"]))
+
+    def test_note_when_not_in_a_clone(self):
+        import json
+        out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)))]))
+        self.assertIn("not run inside a clone", " ".join(out["notes"]))
+        out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)))], merge_checker=lambda s, p: "clean"))
+        self.assertNotIn("not run inside a clone", " ".join(out["notes"]))

@@ -139,13 +139,15 @@ author { login __typename }
 baseRefName headRefName headRefOid
 isCrossRepository maintainerCanModify
 labels(first: 100) { totalCount nodes { name } }
+files(first: 100) { totalCount nodes { path } }
+timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT], last: 1) { nodes { ... on BaseRefChangedEvent { createdAt previousRefName currentRefName } } }
 mergeable mergeStateStatus reviewDecision
 autoMergeRequest { mergeMethod enabledAt }
 reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on Actor { login } ... on Team { slug } } } }
 reviews(last: 100) { totalCount nodes { id url author { login __typename } state body submittedAt commit { oid } } }
 comments(last: 100) { nodes { url author { login __typename } createdAt } }
 reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
-prCommits: commits(first: 100) { totalCount nodes { commit { oid parents { totalCount }
+prCommits: commits(first: 100) { totalCount nodes { commit { oid messageHeadline parents(first: 2) { totalCount nodes { oid } }
   associatedPullRequests(first: 5) { nodes { number merged } } } } }
 commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { totalCount nodes {
   __typename
@@ -512,7 +514,62 @@ def checks_summary(pr: dict, required: list[str] | None = None) -> dict:
             "required": sorted(set(required or []))}
 
 
-def commits_after_review(pr: dict, review_oid: str | None) -> dict | None:
+def merge_check(sha: str, parents: list[str], cwd: str | None = None) -> str | None:
+    """Redo a two-parent merge locally and compare it with the real one:
+    "clean"    = git merges the parents by itself into the same tree;
+    "resolved" = the parents conflict, so someone resolved it by hand;
+    "edited"   = no conflict, but the merge commit changes things anyway;
+    None       = can't tell (no local clone, objects unavailable, old git)."""
+    if len(parents) != 2:
+        return None
+
+    def git(*args):
+        try:
+            return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def have(x):
+        p = git("cat-file", "-e", f"{x}^{{commit}}")
+        return p is not None and p.returncode == 0
+    if not all(have(x) for x in (sha, *parents)):
+        git("fetch", "--quiet", "--no-tags", "origin", sha, *parents)
+        if not all(have(x) for x in (sha, *parents)):
+            return None
+    mt = git("merge-tree", "--write-tree", parents[0], parents[1])
+    if mt is None or mt.returncode not in (0, 1):
+        return None
+    if mt.returncode == 1:
+        return "resolved"
+    real = git("rev-parse", f"{sha}^{{tree}}")
+    if real is None or real.returncode != 0:
+        return None
+    return "clean" if mt.stdout.split()[0] == real.stdout.strip() else "edited"
+
+
+def make_merge_checker(repo: str):
+    """merge_check bound to the current directory, if it is a clone of `repo`."""
+    try:
+        p = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    url = (p.stdout or "").strip().lower().removesuffix(".git")
+    if p.returncode != 0 or not url.endswith(repo.lower()):
+        return None
+    cache: dict[str, str | None] = {}
+
+    def check(sha: str, parents: list[str]) -> str | None:
+        if sha not in cache:
+            cache[sha] = merge_check(sha, parents)
+        return cache[sha]
+    return check
+
+
+def commit_parents(c: dict) -> list[str]:
+    return [n.get("oid") for n in nodes(c.get("parents")) if n.get("oid")]
+
+
+def commits_after_review(pr: dict, review_oid: str | None, merge_checker=None) -> dict | None:
     """How many commits the PR got after the commit Copilot reviewed:
     {"commits": n, "merges": m} (merges = merge commits, e.g. main merged in),
     {"rewritten": True} when that commit is no longer in the PR, or None."""
@@ -525,8 +582,12 @@ def commits_after_review(pr: dict, review_oid: str | None) -> dict | None:
     if idx is None:
         return None if truncated(pr.get("prCommits")) else {"rewritten": True}
     after = oids[idx + 1:]
-    merges = sum(1 for c in after if ((c.get("parents") or {}).get("totalCount") or 1) > 1)
-    return {"commits": len(after), "merges": merges}
+    merges = [c for c in after if ((c.get("parents") or {}).get("totalCount") or 1) > 1]
+    out = {"commits": len(after), "merges": len(merges)}
+    if merge_checker and merges:
+        hand = [c.get("oid") for c in merges if merge_checker(c.get("oid"), commit_parents(c)) in ("resolved", "edited")]
+        out["hand_merges"] = len(hand)
+    return out
 
 
 def after_review_text(ar: dict | None) -> str:
@@ -537,11 +598,14 @@ def after_review_text(ar: dict | None) -> str:
     if not ar["commits"]:
         return ""
     own = ar["commits"] - ar["merges"]
+    hand = ar.get("hand_merges") or 0
     parts = []
     if own:
         parts.append(f"{own} new commit(s)")
-    if ar["merges"]:
-        parts.append(f"{ar['merges']} merge(s) of the base")
+    if ar["merges"] - hand:
+        parts.append(f"{ar['merges'] - hand} merge(s) of the base")
+    if hand:
+        parts.append(f"{hand} merge(s) of the base with conflicts resolved by hand (code Copilot hasn't seen)")
     return "; " + " + ".join(parts) + " since the Copilot review"
 
 
@@ -562,7 +626,15 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
         if requested:
             return {"status": "pending", "verdict": None, "detail": "Copilot review requested, not arrived yet"}
         if expected:
-            return {"status": "missing", "verdict": None, "detail": "no Copilot review and none requested (repo normally gets one); request it yourself if you want it"}
+            moved = next(iter(nodes(pr.get("timelineItems"))), None)
+            why = ""
+            if moved and moved.get("previousRefName"):
+                why = (f"; it was opened against `{moved['previousRefName']}` and moved to `{moved.get('currentRefName')}`"
+                       " later (when the PR it was stacked on merged), so a rule that requests Copilot on new PRs"
+                       " never fired for it")
+            return {"status": "missing", "verdict": None,
+                    "detail": "no Copilot review and none requested (repo normally gets one)" + why
+                              + "; request it yourself if you want it"}
         return {"status": "n/a", "verdict": None, "detail": "Copilot not used in this repo"}
     latest = reviews[-1]
     verdict = copilot_verdict(latest.get("body"))
@@ -596,7 +668,7 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
     candidates.sort(key=lambda c: ts(c.get("at")))
 
     label = {"green": "green", "blue": "blue", "yellow": "yellow", "none": "no verdict"}[verdict]
-    ar = commits_after_review(pr, (latest.get("commit") or {}).get("oid"))
+    ar = commits_after_review(pr, (latest.get("commit") or {}).get("oid"), cfg.get("_merge_checker"))
     base = {"verdict": verdict, "review_url": latest.get("url"), "after_review": ar}
     if unresolved:
         return {**base, "status": "unhandled",
@@ -679,7 +751,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     res = {
         "number": pr["number"], "title": pr.get("title"), "url": pr.get("url"), "author": author,
         "base": pr.get("baseRefName"), "head": pr.get("headRefName"), "head_sha": pr.get("headRefOid"),
-        "excluded": None, "blockers": [], "warnings": [], "gates": {}, "next": None,
+        "excluded": None, "blockers": [], "warnings": [], "gates": {"up_to_date": {"behind_by": None}}, "next": None,
         "update_method": ctx["cfg"].get("update", "merge"),
     }
 
@@ -813,7 +885,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
 MERGE_OF_BASE = r"^Merge (remote-tracking )?branch '(origin/)?{base}'"
 
 
-def classify_head_change(compare: dict, base: str, in_base=None) -> dict:
+def classify_head_change(compare: dict, base: str, in_base=None, merge_checker=None) -> dict:
     """compare = REST compare <approved head>...<current head>. Returns
     {"kind": "rewritten"} (force-push: the approved head isn't an ancestor),
     {"kind": "merges_only", "count": n} (only merges of the base were added,
@@ -822,7 +894,7 @@ def classify_head_change(compare: dict, base: str, in_base=None) -> dict:
     if compare.get("status") not in ("ahead", "identical"):
         return {"kind": "rewritten", "status": compare.get("status")}
     pat = re.compile(MERGE_OF_BASE.format(base=re.escape(base)))
-    new, merges = [], 0
+    new, merges, unchecked = [], 0, 0
     for c in compare.get("commits") or []:
         # The compare lists every commit reachable from the new head but not
         # from the approved one, so a merge of the base brings the base's own
@@ -836,21 +908,34 @@ def classify_head_change(compare: dict, base: str, in_base=None) -> dict:
         # says; the standard git message is only the fallback without a lookup.
         is_base_merge = len(parents) > 1 and (
             any(in_base(p) for p in parents[1:]) if in_base else bool(pat.match(msg)))
+        if is_base_merge and merge_checker:
+            how = merge_checker(c.get("sha"), parents)
+            if how in ("resolved", "edited"):
+                new.append(f"{msg or c.get('sha', '?')[:7]} (merge of the base with "
+                           + ("conflicts resolved by hand" if how == "resolved" else "extra changes") + ")")
+                continue
+            if how is None:
+                unchecked += 1
         if is_base_merge:
             merges += 1
         else:
             new.append(msg or c.get("sha", "?")[:7])
     if new:
         return {"kind": "new_commits", "commits": new}
-    return {"kind": "merges_only", "count": merges}
+    out = {"kind": "merges_only", "count": merges}
+    if unchecked:
+        out["unchecked_merges"] = unchecked
+    return out
 
 
 def apply_head_change(r: dict, approved: str, change: dict) -> None:
     """Approved-head check (only PRs the user approved in the briefing)."""
     r["head_changed"] = {"approved": approved, **change}
     if change["kind"] == "merges_only":
-        r["warnings"].append(f"head changed since the briefing ({approved[:7]} → {(r['head_sha'] or '')[:7]}): "
-                             f"only {change['count']} merge(s) of the base, OK")
+        r["warnings"].append(f"someone else pushed to it during the run ({approved[:7]} → {(r['head_sha'] or '')[:7]}):"
+                             f" only {change['count']} clean merge(s) of the base, OK"
+                             + (f"; {change['unchecked_merges']} couldn't be checked locally for hand-resolved conflicts"
+                                if change.get("unchecked_merges") else ""))
         return
     if change["kind"] == "unverified":
         why = (f"can't verify the head against the briefing (comparing {approved[:7]}...{(r['head_sha'] or '')[:7]}"
@@ -923,6 +1008,9 @@ def cmd_status(a) -> int:
     approved = parse_heads(getattr(a, "approved_heads", None))  # validate before any network call
     repo = a.repo or current_repo()
     cfg = apply_cli_overrides(load_config(repo), a)
+    # Local clone of this repo: lets the script redo merges of the base to
+    # tell clean ones from conflicts resolved by hand (GitHub's API can't).
+    cfg["_merge_checker"] = make_merge_checker(repo)
     meta, prs, viewer = fetch_repo(repo, a.pr)
     # Only PRs into the repository's default branch are ever queued (by design).
     base = (meta.get("defaultBranchRef") or {}).get("name") or "main"
@@ -963,7 +1051,8 @@ def cmd_status(a) -> int:
             continue
         ok, cmp_ = rest(f"repos/{repo}/compare/{want}...{r['head_sha']}")
         if ok and isinstance(cmp_, dict):
-            change = classify_head_change(cmp_, base, in_base=base_membership(repo, base, want))
+            change = classify_head_change(cmp_, base, in_base=base_membership(repo, base, want),
+                                          merge_checker=cfg.get("_merge_checker"))
         else:
             change = {"kind": "unverified", "error": str(cmp_).strip().splitlines()[0][:160] if cmp_ else "no response"}
         apply_head_change(r, want, change)
@@ -989,8 +1078,24 @@ def cmd_status(a) -> int:
                 f"`{base}` (if its branch is deleted on merge), still carrying its original commits, which can "
                 "conflict after a squash; they are NOT part of this run")
 
+    # PRs in the queue touching the same files: the later one may conflict
+    # once the earlier lands (it is then skipped). Said up front.
+    files_of = {pr["number"]: {f.get("path") for f in nodes(pr.get("files"))} for pr in prs}
+    goers = [r for r in results if r["next"] in ("update", "merge", "wait_checks", "confirm")]
+    for i, r in enumerate(goers):
+        shared = {}
+        for earlier in goers[:i]:
+            common = sorted(files_of.get(r["number"], set()) & files_of.get(earlier["number"], set()))
+            if common:
+                shared[earlier["number"]] = common
+        if shared:
+            r["overlaps"] = shared
+
     perm = meta.get("viewerPermission")
     notes = []
+    if not cfg.get("_merge_checker"):
+        notes.append(f"not run inside a clone of {repo}: merges of the base can't be checked for conflicts"
+                     " resolved by hand")
     if unchecked:
         notes.append("no approved head given for " + ", ".join(f"#{n}" for n in unchecked)
                      + ": their head was NOT checked against the briefing")
@@ -1189,7 +1294,7 @@ def print_brief(out: dict) -> None:
             for cand in g.get("candidates", []):
                 print(f"  - comment by @{cand['author']}: {cand['url']}")
             ar = g.get("after_review") or {}
-            own = (ar.get("commits") or 0) - (ar.get("merges") or 0)
+            own = (ar.get("commits") or 0) - (ar.get("merges") or 0) + (ar.get("hand_merges") or 0)
             if ar.get("rewritten"):
                 print("  - **Note:** the reviewed commit is no longer in the PR: Copilot hasn't seen the code as it is now.")
             elif own > 0:
@@ -1205,6 +1310,14 @@ def print_brief(out: dict) -> None:
         for reason, nums in by_cause.items():
             print(f"- " + ", ".join(f"#{n}" for n in nums) + f": {reason}. Replaying those commits on top of"
                   f" `{out['base']}` conflicts, so GitHub's rebase fails ({'they will be updated by merging the base in instead' if c.get('rebase_fallback', 'merge') == 'merge' and out.get('merge_method') == 'squash' else 'they are skipped'}).")
+    over = [r for r in out["queue"] if r.get("overlaps")]
+    if over:
+        print("\n### PRs touching the same files")
+        for r in over:
+            for n, paths in r["overlaps"].items():
+                shown = ", ".join(f"`{x}`" for x in paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+                print(f"- #{r['number']} and #{n} both change {shown}: once #{n} lands, #{r['number']} may conflict"
+                      " (it would then be skipped).")
     deps = [r for r in out["queue"] if r.get("dependents")]
     if deps:
         print("\n### Stacked PRs")

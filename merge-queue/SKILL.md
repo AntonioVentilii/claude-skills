@@ -58,6 +58,12 @@ gh auth status            # must be logged in with write access to the repo
 gh repo view --json nameWithOwner -q .nameWithOwner
 ```
 
+Run the script **from inside a clone of the repo** (its `origin` must be that
+repo). The script uses it to redo merges of the base locally (`git merge-tree`,
+git ≥ 2.38) and tell a clean merge from one whose conflicts someone resolved by
+hand: GitHub's API can't show that. Outside a clone it says so in `notes`, and
+those merges count as clean.
+
 If `gh` is missing or unauthenticated (e.g. a cloud session that only has the
 GitHub MCP tools), follow `references/mcp-fallback.md` instead of the script.
 
@@ -71,7 +77,7 @@ python3 SKILL/scripts/mq.py status [flags]                  # JSON you act on
 The `brief` output is a schematic summary: the settings in force (which PRs,
 order, Copilot, update, merge method, branch rules found), the gates, and a
 table with the plan for each PR. The script prints it in English: **translate
-every line, headings and table included, into the user's language** before
+every line, headings, table and the closing line included, into the user's language** before
 showing it, keeping it schematic and plain. Someone who doesn't know GitHub internals
 should understand what will happen. Don't add prose around it.
 
@@ -112,7 +118,9 @@ that note appears, the check didn't run for that PR, so fix the command. If some
 - if the push is only a merge of the base (someone pressed Update branch, or
   merged `origin/main` locally), the run continues, with a warning that goes
   in the report. A merge counts as "of the base" when one of its parents is in
-  the base's history, whatever its commit message says;
+  the base's history, whatever its commit message says. A merge of the base
+  whose conflicts were **resolved by hand** (or that changes anything beyond
+  the merge) is new code nobody approved: it counts as a new commit;
 - if it adds new commits, or rewrites the branch, the PR is skipped as "not
   what you approved". It goes in the queue of the next run.
 
@@ -259,7 +267,10 @@ skipped only for transient reasons (Copilot not arrived yet, CI still running,
 mergeability unknown), re-run `status --pr <those numbers>` once and process any
 whose `next` is now `update`/`wait_checks`/`merge`. Only approved PRs, never
 the whole repo. One sweep, not a loop. A PR that newly needs `confirm` goes in the report as a
-question, not a new prompt mid-run.
+question, not a new prompt mid-run. A PR skipped for a **conflict** is not
+retried, even if someone resolves it during the run: the resolution is new code
+the user hasn't approved. Report it as "conflict resolved during the run:
+re-run the queue to approve it".
 
 ### Hard rules
 
@@ -327,6 +338,9 @@ Legend: ✅ merged · ⏸ not merged (⏳ armed, in auto mode) · ⏭ skipped (g
   around the queue: stacked PRs retargeted, PRs that appeared, conflicts that
   appeared ("not processed"), and any head that someone else pushed to during
   the run, with what they pushed and whether the PR went ahead or was skipped.
+  When that happens, say plainly that someone (another session, an automation)
+  is working on the queue's PRs in parallel, and suggest pausing it while the
+  queue runs: each of their merges chases a base that is still moving.
 
 End by offering the follow-ups that only need the user (address Copilot
 comments on #14, fix CI on #16, …) as a separate task, and offering to re-run
