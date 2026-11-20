@@ -142,7 +142,7 @@ labels(first: 100) { totalCount nodes { name } }
 mergeable mergeStateStatus reviewDecision
 autoMergeRequest { mergeMethod enabledAt }
 reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on Actor { login } ... on Team { slug } } } }
-reviews(last: 100) { totalCount nodes { id url author { login __typename } state body submittedAt } }
+reviews(last: 100) { totalCount nodes { id url author { login __typename } state body submittedAt commit { oid } } }
 comments(last: 100) { nodes { url author { login __typename } createdAt } }
 reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
 prCommits: commits(first: 100) { totalCount nodes { commit { oid parents { totalCount }
@@ -444,6 +444,39 @@ def checks_summary(pr: dict, required: list[str] | None = None) -> dict:
     return {"state": state, "failing": failing, "pending": pending, "passed": len(passed), "sha": commit.get("oid")}
 
 
+def commits_after_review(pr: dict, review_oid: str | None) -> dict | None:
+    """How many commits the PR got after the commit Copilot reviewed:
+    {"commits": n, "merges": m} (merges = merge commits, e.g. main merged in),
+    {"rewritten": True} when that commit is no longer in the PR, or None."""
+    if not review_oid:
+        return None
+    oids = [(n.get("commit") or {}) for n in nodes(pr.get("prCommits"))]
+    if not oids:
+        return None
+    idx = next((i for i, c in enumerate(oids) if c.get("oid") == review_oid), None)
+    if idx is None:
+        return None if truncated(pr.get("prCommits")) else {"rewritten": True}
+    after = oids[idx + 1:]
+    merges = sum(1 for c in after if ((c.get("parents") or {}).get("totalCount") or 1) > 1)
+    return {"commits": len(after), "merges": merges}
+
+
+def after_review_text(ar: dict | None) -> str:
+    if not ar:
+        return ""
+    if ar.get("rewritten"):
+        return "; the reviewed commit is no longer in the PR (history rewritten since the review)"
+    if not ar["commits"]:
+        return ""
+    own = ar["commits"] - ar["merges"]
+    parts = []
+    if own:
+        parts.append(f"{own} new commit(s)")
+    if ar["merges"]:
+        parts.append(f"{ar['merges']} merge(s) of the base")
+    return "; " + " + ".join(parts) + " since the Copilot review"
+
+
 def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: bool = False) -> dict:
     """Returns {status: ok|pending|missing|unhandled|confirm|n/a, verdict, detail, ...}.
 
@@ -495,7 +528,8 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
     candidates.sort(key=lambda c: ts(c.get("at")))
 
     label = {"green": "green", "blue": "blue", "yellow": "yellow", "none": "no verdict"}[verdict]
-    base = {"verdict": verdict, "review_url": latest.get("url")}
+    ar = commits_after_review(pr, (latest.get("commit") or {}).get("oid"))
+    base = {"verdict": verdict, "review_url": latest.get("url"), "after_review": ar}
     if unresolved:
         return {**base, "status": "unhandled", "detail": f"{label}: {len(unresolved)} unresolved Copilot thread(s)"}
     needs_answer = verdict == "blue" or (verdict == "yellow" and not latest_has_threads)
@@ -506,8 +540,8 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
         if not confirmed:
             return {**base, "status": "confirm", "candidates": candidates,
                     "detail": f"{what}: {len(candidates)} comment(s) since the review; ask the user whether it is resolved"}
-        return {**base, "status": "ok", "detail": f"{label}, confirmed resolved by the user"}
-    return {**base, "status": "ok", "detail": f"{label}, handled"}
+        return {**base, "status": "ok", "detail": f"{label}, confirmed resolved by the user" + after_review_text(ar)}
+    return {**base, "status": "ok", "detail": f"{label}, handled" + after_review_text(ar)}
 
 
 def rebase_risk(pr: dict) -> dict | None:
@@ -704,6 +738,46 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     return res
 
 
+MERGE_OF_BASE = r"^Merge (remote-tracking )?branch '(origin/)?{base}'"
+
+
+def classify_head_change(compare: dict, base: str) -> dict:
+    """compare = REST compare <approved head>...<current head>. Returns
+    {"kind": "rewritten"} (force-push: the approved head isn't an ancestor),
+    {"kind": "merges_only", "count": n} (only merges of the base were added,
+    e.g. someone pressed Update branch), or {"kind": "new_commits", "commits":
+    [headline, ...]} (new work nobody approved)."""
+    if compare.get("status") not in ("ahead", "identical"):
+        return {"kind": "rewritten"}
+    pat = re.compile(MERGE_OF_BASE.format(base=re.escape(base)))
+    new, merges = [], 0
+    for c in compare.get("commits") or []:
+        msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0] if c.get("commit") else ""
+        if len(c.get("parents") or []) > 1 and pat.match(msg):
+            merges += 1
+        else:
+            new.append(msg or c.get("sha", "?")[:7])
+    if new:
+        return {"kind": "new_commits", "commits": new}
+    return {"kind": "merges_only", "count": merges}
+
+
+def apply_head_change(r: dict, approved: str, change: dict) -> None:
+    """Approved-head check (only PRs the user approved in the briefing)."""
+    r["head_changed"] = {"approved": approved, **change}
+    if change["kind"] == "merges_only":
+        r["warnings"].append(f"head changed since the briefing ({approved[:7]} → {(r['head_sha'] or '')[:7]}): "
+                             f"only {change['count']} merge(s) of the base, OK")
+        return
+    if change["kind"] == "rewritten":
+        why = f"branch rewritten since the briefing (was {approved[:7]}, force-pushed)"
+    else:
+        why = (f"{len(change['commits'])} new commit(s) pushed since the briefing: "
+               + "; ".join(change["commits"][:3]) + ("…" if len(change["commits"]) > 3 else ""))
+    r["blockers"].append(why + " - not what you approved; re-run the queue to review it")
+    r["next"] = "skip"
+
+
 def choose_method(meta: dict, rules: dict, preferred: str) -> tuple[str | None, str]:
     allowed = []
     if meta.get("squashMergeAllowed"):
@@ -737,6 +811,15 @@ def apply_cli_overrides(cfg: dict, a) -> dict:
     return cfg
 
 
+def parse_heads(items) -> dict[int, str]:
+    out = {}
+    for it in items or []:
+        n, _, sha = it.partition("=")
+        if n.strip().lstrip("#").isdigit() and sha.strip():
+            out[int(n.strip().lstrip("#"))] = sha.strip()
+    return out
+
+
 def cmd_status(a) -> int:
     repo = a.repo or current_repo()
     cfg = apply_cli_overrides(load_config(repo), a)
@@ -764,6 +847,17 @@ def cmd_status(a) -> int:
     results = [evaluate_pr(pr, ctx) for pr in prs]
     if not a.pr:
         results.sort(key=lambda r: r["number"])
+
+    # Heads the user approved in the briefing: anything else pushed since
+    # (other than merges of the base) is not what they said go to.
+    approved = parse_heads(getattr(a, "approved_heads", None))
+    for r in results:
+        want = approved.get(r["number"])
+        if not want or r["next"] == "excluded" or (r["head_sha"] or "").startswith(want):
+            continue
+        ok, cmp_ = rest(f"repos/{repo}/compare/{want}...{r['head_sha']}")
+        change = classify_head_change(cmp_, base) if ok and isinstance(cmp_, dict) else {"kind": "rewritten"}
+        apply_head_change(r, want, change)
 
     # Stacked PRs: a queued PR whose head branch is the base of other open PRs.
     # Merging it makes GitHub retarget them to the default branch (when the
@@ -853,7 +947,7 @@ def why_text(r: dict) -> str:
                      "pending": "CI running", "failure": "CI failing"}.get(ck["state"], ck["state"]))
     behind = (g.get("up_to_date") or {}).get("behind_by")
     if behind:
-        bits.append(f"behind by {behind}")
+        bits.append(f"behind by {behind} right now")
     bits += r.get("blockers", []) + r.get("warnings", [])
     return "; ".join(bits) or "all gates pass"
 
@@ -868,7 +962,7 @@ def plan_text(r: dict, base: str, later: bool) -> str:
     up = update_phrase(r, base)
     nxt = r["next"]
     if nxt == "update" or (later and r.get("update_method") != "none" and nxt in ("merge", "wait_checks")):
-        when = " (after the PRs above land)" if later and nxt != "update" else ""
+        when = " (after the PRs above land)" if later else ""
         return f"{up}{when}, wait for CI, merge"
     return {"wait_checks": "wait for CI, merge", "merge": "merge",
             "confirm": f"ASK YOU first (Copilot), then {up}, CI, merge", "skip": "skip"}.get(nxt, nxt)
@@ -1054,6 +1148,8 @@ def main(argv=None) -> int:
     s.add_argument("--update", choices=["rebase", "merge", "none"])
     s.add_argument("--method", choices=["squash", "merge", "rebase"])
     s.add_argument("--confirmed", type=int, nargs="*", help="PRs whose blue/yellow Copilot review the user confirmed as resolved")
+    s.add_argument("--approved-heads", nargs="*", metavar="N=SHA",
+                   help="head SHA of each PR as shown in the approved briefing; a PR whose head got new commits since is skipped")
     s.add_argument("--format", choices=["json", "table", "brief"], default="json")
     s.set_defaults(fn=cmd_status)
 

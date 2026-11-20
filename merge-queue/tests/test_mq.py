@@ -289,7 +289,8 @@ class FailClosed(unittest.TestCase):
 class FieldTest(unittest.TestCase):
     """Regressions from the first live run (AntonioVentilii/neve)."""
 
-    def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None):
+    def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None,
+                   approved_heads=None, compare=None):
         import argparse
         import contextlib
         import io
@@ -306,11 +307,13 @@ class FieldTest(unittest.TestCase):
         def fake_rest(path):
             if "/rules/branches/" in path:
                 return True, rules_payload
+            if "/compare/" in path and compare is not None:
+                return True, compare
             return False, "404"
         cfg = dict(mq.DEFAULTS)
         cfg.update(cfg_extra or {})
         a = argparse.Namespace(repo="o/r", pr=pr_args, author=None, copilot=None, update=None, method=None,
-                               confirmed=None, format=fmt)
+                               confirmed=None, format=fmt, approved_heads=approved_heads)
         buf = io.StringIO()
         with mock.patch.object(mq, "fetch_repo", return_value=(meta, prs, "antonio")), \
                 mock.patch.object(mq, "rest", side_effect=fake_rest), \
@@ -465,3 +468,75 @@ class UpdateBranchDefault(unittest.TestCase):
         self.assertNotIn("If a rebase can't work", text)
         out = json.loads(self.run_status(p))
         self.assertEqual({r["update_method"] for r in out["queue"]}, {"merge"})
+
+
+
+def merge_commit(base="main", sha="m1"):
+    return {"sha": sha, "parents": [{"sha": "a"}, {"sha": "b"}],
+            "commit": {"message": f"Merge branch '{base}' into feature\n\nbody"}}
+
+
+def plain_commit(msg="fix: tweak", sha="p1"):
+    return {"sha": sha, "parents": [{"sha": "a"}], "commit": {"message": msg}}
+
+
+class ThirdRun(unittest.TestCase):
+    """Third live run on neve: all six merged, plus four findings."""
+
+    run_status = FieldTest.run_status
+
+    def test_later_prs_say_after_the_ones_above_even_when_behind(self):
+        r = mq.evaluate_pr(pr(number=103, reviews=conn(review(GREEN))), ctx(behind={103: 2}))
+        self.assertIn("after the PRs above land", mq.plan_text(r, "main", later=True))
+        self.assertNotIn("after the PRs above land", mq.plan_text(r, "main", later=False))
+
+    def test_behind_count_is_labelled_as_a_snapshot(self):
+        r = mq.evaluate_pr(pr(reviews=conn(review(GREEN))), ctx(behind={1: 1}))
+        self.assertIn("behind by 1 right now", mq.why_text(r))
+
+    def test_commits_after_copilot_review(self):
+        rv = {**review(YELLOW), "commit": {"oid": "c1"}}
+        commits = {"totalCount": 4, "nodes": [
+            {"commit": {"oid": "c1", "parents": {"totalCount": 1}}},
+            {"commit": {"oid": "c2", "parents": {"totalCount": 1}}},
+            {"commit": {"oid": "c3", "parents": {"totalCount": 2}}},
+            {"commit": {"oid": "c4", "parents": {"totalCount": 1}}}]}
+        p = pr(reviews=conn(rv), reviewThreads=conn(thread(True)), prCommits=commits)
+        cp = mq.eval_copilot(p, "auto", True, mq.DEFAULTS)
+        self.assertEqual(cp["status"], "ok")
+        self.assertEqual(cp["after_review"], {"commits": 3, "merges": 1})
+        self.assertIn("2 new commit(s) + 1 merge(s) of the base since the Copilot review", cp["detail"])
+        gone = pr(reviews=conn({**rv, "commit": {"oid": "zz"}}), reviewThreads=conn(thread(True)), prCommits=commits)
+        self.assertIn("history rewritten", mq.eval_copilot(gone, "auto", True, mq.DEFAULTS)["detail"])
+
+    def test_classify_head_change(self):
+        self.assertEqual(mq.classify_head_change({"status": "ahead", "commits": [merge_commit()]}, "main"),
+                         {"kind": "merges_only", "count": 1})
+        self.assertEqual(mq.classify_head_change({"status": "ahead", "commits": [merge_commit("origin/main")]}, "main")["kind"],
+                         "merges_only")
+        ch = mq.classify_head_change({"status": "ahead", "commits": [merge_commit(), plain_commit()]}, "main")
+        self.assertEqual(ch, {"kind": "new_commits", "commits": ["fix: tweak"]})
+        self.assertEqual(mq.classify_head_change({"status": "diverged", "commits": []}, "main")["kind"], "rewritten")
+        # a merge of some other branch is new work, not a base update
+        self.assertEqual(mq.classify_head_change({"status": "ahead", "commits": [merge_commit("feat/x")]}, "main")["kind"],
+                         "new_commits")
+
+    def test_head_changed_since_briefing(self):
+        import json
+        p = [pr(number=108, headRefOid="9eb2543ffff", reviews=conn(review(GREEN)))]
+        # only a merge of main by someone else: continue, but say so
+        out = json.loads(self.run_status(p, pr_args=[108], approved_heads=["108=64ad16b"],
+                                         compare={"status": "ahead", "commits": [merge_commit("origin/main")]}))
+        r = out["queue"][0]
+        self.assertEqual(r["head_changed"]["kind"], "merges_only")
+        self.assertNotEqual(r["next"], "skip")
+        self.assertIn("head changed since the briefing", " ".join(r["warnings"]))
+        # new work nobody approved: skip
+        out = json.loads(self.run_status(p, pr_args=[108], approved_heads=["108=64ad16b"],
+                                         compare={"status": "ahead", "commits": [plain_commit("feat: more")]}))
+        r = out["queue"][0]
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("feat: more", " ".join(r["blockers"]))
+        # unchanged head: nothing to say
+        out = json.loads(self.run_status(p, pr_args=[108], approved_heads=["108=9eb2543"]))
+        self.assertNotIn("head_changed", out["queue"][0])

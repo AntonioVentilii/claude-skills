@@ -97,6 +97,18 @@ PR that shows up mid-run can never be merged by this run. That includes PRs
 retargeted to the default branch after their base PR merged, or new ones. Such PRs go
 in the report as "appeared during the run, not processed".
 
+**Approved heads.** The go-ahead also covers each PR's content as it was in
+the briefing. Write down each PR's `head_sha` from the JSON
+(`HEADS="102=64ad16b 103=…"`) and pass `--approved-heads $HEADS` to every
+later `status` call. If someone else pushes to a PR during the run:
+- if the push is only a merge of the base (someone pressed Update branch), the
+  run continues, with a warning that goes in the report;
+- if it adds new commits, or rewrites the branch, the PR is skipped as "not
+  what you approved". It goes in the queue of the next run.
+
+After **your own** update in step a, replace that PR's entry with the new head
+that `wait-checks` reports, so your own merge commit isn't flagged.
+
 **Stacked PRs.** When a queued PR is the base of other open PRs, the briefing
 lists them under "Stacked PRs": merging it makes GitHub retarget them to the
 default branch (when the branch is deleted on merge), still carrying the
@@ -162,7 +174,8 @@ of guessing.
 ## 4. Run the queue
 
 Process the approved queue in order. Keep a running log per PR (result +
-reason) for the report. **Re-run `mq.py status --pr N [--confirmed …]` right
+reason) for the report. **Re-run `mq.py status --pr N [--confirmed …]
+--approved-heads $HEADS` right
 before acting on each PR**, because merging the previous PR moved the base, and
 act on that fresh `next`:
 
@@ -180,7 +193,7 @@ gh pr update-branch N                   # add --rebase only when update_method i
 python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
 #    (no --not-sha when there was no update)
 # c. re-verify everything on the final head
-python3 SKILL/scripts/mq.py status --pr N [--confirmed N]
+python3 SKILL/scripts/mq.py status --pr N [--confirmed N] --approved-heads $HEADS
 # d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase).
 #    Direct merge by default; add --auto only when merge_mode is "auto".
 gh pr merge N --<merge_method> --match-head-commit <head_sha>
@@ -211,7 +224,8 @@ How to read each step:
   re-review triggered by the update may have landed (yellow, new threads, or a
   new blue that needs asking → skip and report it), stale approvals may have
   been dismissed, or the base may have moved again (`update` → back to a; at
-  most 3 cycles per PR, then skip as "base keeps moving").
+  most 3 cycles per PR, then skip as "base keeps moving"), or someone else
+  pushed new commits since the briefing (approved-head check → skip).
 - **d.** `merge_method` from the snapshot gives `--squash`, `--merge` or
   `--rebase`. `--match-head-commit` makes GitHub refuse the merge if the head
   moved since c. **Default `merge_mode: direct`**: merge now, no `--auto`.
@@ -283,14 +297,25 @@ Excluded: #10 `chore(main): release 2.3.0` (release PR) · #11 by @bob (only you
 ```
 
 Legend: ✅ merged · ⏸ not merged (⏳ armed, in auto mode) · ⏭ skipped (gate) ·
-❌ CI failed · ❓ needs your confirmation · 🚫 excluded. After the table, list
-anything that changed around the queue during the run (stacked PRs retargeted,
-PRs that appeared, conflicts that appeared) as "not processed". Include warnings (e.g. unresolved
-human threads that aren't enforced) under the PR's row. **When several PRs
-share one cause** (e.g. the same rebase conflict), state the cause once
-below the table, with the fix, and keep their rows short ("see below"). End by offering the
-follow-ups that only need you (address Copilot comments on #14, fix CI on #16, …)
-as a separate task, and offering to re-run the queue later.
+❌ CI failed · ❓ needs your confirmation · 🚫 excluded.
+
+- **Fresh numbers.** Take figures like "behind by N" from the `status` you ran
+  right before acting on that PR, not from the briefing: they change after
+  every merge.
+- **Under each row:** its warnings, e.g. unresolved human threads that aren't
+  enforced, or "N new commits since the Copilot review" (information, not a
+  gate).
+- **One shared cause, said once.** When several PRs share one cause (e.g. the
+  same rebase conflict), state it once below the table with the fix, and keep
+  their rows short ("see below").
+- **Changed during the run.** After the table, list anything that changed
+  around the queue: stacked PRs retargeted, PRs that appeared, conflicts that
+  appeared ("not processed"), and any head that someone else pushed to during
+  the run, with what they pushed and whether the PR went ahead or was skipped.
+
+End by offering the follow-ups that only need the user (address Copilot
+comments on #14, fix CI on #16, …) as a separate task, and offering to re-run
+the queue later.
 
 ## Configuration
 
