@@ -25,6 +25,9 @@ into `~/.claude/skills/` so Claude Code loads it locally.
   `merge-queue/config/repos.json`; needs an authenticated `gh`. Trigger with
   `/merge-queue` (`/merge-queue all`, `/merge-queue #12 #15`, `dry run`, …).
 
+Every skill has a help page with examples: `/<skill> help` (e.g. `/merge-queue help`,
+`/sapiens help`), or ask "come si usa <skill>?".
+
 ## Install on a machine (or after a fresh clone)
 
 ```bash
@@ -45,6 +48,8 @@ keeps it backed up + syncable across machines.
 1. Edit files under the skill folder here (this repo).
 2. Commit + push — that's the backup.
 3. New skill? Create its folder, then symlink it into `~/.claude/skills/`.
+4. Give it a `references/help.md` (what it does, examples of what to type) and a
+   short `## Help` section in its SKILL.md that shows that page on "help" and stops.
 
 ## Future: share as a plugin
 
