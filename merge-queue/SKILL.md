@@ -106,8 +106,10 @@ string (`--approved-heads "$HEADS"`). Never pass an unquoted `$HEADS`: zsh,
 the default shell on macOS, doesn't split it. The script now rejects anything
 malformed, and lists under `notes` any approved PR it had no head for: if
 that note appears, the check didn't run for that PR, so fix the command. If someone else pushes to a PR during the run:
-- if the push is only a merge of the base (someone pressed Update branch), the
-  run continues, with a warning that goes in the report;
+- if the push is only a merge of the base (someone pressed Update branch, or
+  merged `origin/main` locally), the run continues, with a warning that goes
+  in the report. A merge counts as "of the base" when one of its parents is in
+  the base's history, whatever its commit message says;
 - if it adds new commits, or rewrites the branch, the PR is skipped as "not
   what you approved". It goes in the queue of the next run.
 

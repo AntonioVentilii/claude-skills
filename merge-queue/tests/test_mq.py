@@ -608,3 +608,60 @@ class FourthRun(unittest.TestCase):
         text = self.run_status(p, fmt="brief", rules_payload=payload)
         self.assertIn("Other branch rules", text)
         self.assertIn("re-reviews after every push", text)
+
+
+class FifthRun(unittest.TestCase):
+    """Fifth live run (uliveto): 3 of 3 approved merged; five briefing findings."""
+
+    run_status = FieldTest.run_status
+
+    def blue_with_late_commit(self):
+        rv = {**review(BLUE), "commit": {"oid": "c1"}, "url": "https://x/r"}
+        commits = {"totalCount": 4, "nodes": [
+            {"commit": {"oid": "c1", "parents": {"totalCount": 1}}},
+            {"commit": {"oid": "m1", "parents": {"totalCount": 2}}},
+            {"commit": {"oid": "m2", "parents": {"totalCount": 2}}},
+            {"commit": {"oid": "fix", "parents": {"totalCount": 1}}}]}
+        return pr(number=655, reviews=conn(rv), prCommits=commits,
+                  comments=conn({"url": "https://x/c", "author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+
+    def test_confirm_shows_commits_copilot_never_saw(self):
+        cp = mq.eval_copilot(self.blue_with_late_commit(), "auto", True, mq.DEFAULTS)
+        self.assertEqual(cp["status"], "confirm")
+        self.assertIn("1 new commit(s) + 2 merge(s) of the base since the Copilot review", cp["detail"])
+        text = self.run_status([self.blue_with_late_commit()], fmt="brief")
+        self.assertIn("1 new commit(s) arrived after the review, and Copilot hasn't seen them", text)
+
+    def test_skipped_row_says_it_once(self):
+        r = mq.evaluate_pr(pr(number=652), ctx())  # no Copilot review, none requested
+        self.assertEqual(r["next"], "skip")
+        self.assertEqual(mq.why_text(r).count("none requested"), 1)
+
+    def test_branch_only_rules_are_not_listed(self):
+        import json
+        payload = [{"type": t, "parameters": {}} for t in ("creation", "deletion", "non_fast_forward", "code_quality")]
+        out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)))], rules_payload=payload))
+        self.assertEqual(out["rules"]["other"], ["code_quality"])
+
+    def test_merge_of_base_recognised_by_parents(self):
+        odd = {"sha": "6443ff7", "parents": [{"sha": "feat"}, {"sha": "mainsha"}],
+               "commit": {"message": "Merge origin/main into av/family-loans"}}
+        cmp_ = {"status": "ahead", "commits": [odd]}
+        # message alone doesn't match the standard git wording...
+        self.assertEqual(mq.classify_head_change(cmp_, "main")["kind"], "new_commits")
+        # ...but its second parent is in main's history: it is a merge of the base
+        self.assertEqual(mq.classify_head_change(cmp_, "main", in_base=lambda s: s == "mainsha"),
+                         {"kind": "merges_only", "count": 1})
+        # a merge of another branch stays new work, whatever its message says
+        fake = {"sha": "x", "parents": [{"sha": "feat"}, {"sha": "other"}],
+                "commit": {"message": "Merge branch 'main' into feat"}}
+        self.assertEqual(mq.classify_head_change({"status": "ahead", "commits": [fake]}, "main",
+                                                 in_base=lambda s: False)["kind"], "new_commits")
+
+    def test_confirm_plan_skips_update_when_up_to_date(self):
+        r = mq.evaluate_pr(self.blue_with_late_commit(), ctx(behind={655: 0}))
+        self.assertEqual(r["next"], "confirm")
+        self.assertEqual(mq.plan_text(r, "main", later=False), "ASK YOU first (Copilot), then merge")
+        self.assertIn("update with main", mq.plan_text(r, "main", later=True))
+        r = mq.evaluate_pr(self.blue_with_late_commit(), ctx(behind={655: 2}))
+        self.assertIn("update with main", mq.plan_text(r, "main", later=False))

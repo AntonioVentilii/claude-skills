@@ -263,6 +263,11 @@ def repo_uses_copilot(repo: str, open_prs: list[dict]) -> bool:
     return False
 
 
+# Rule types about creating, deleting or force-pushing the branch itself:
+# they never affect merging a PR, so listing them is noise.
+IRRELEVANT_RULES = {"creation", "deletion", "non_fast_forward"}
+
+
 def fetch_rules(repo: str, base: str) -> dict:
     """Merge rulesets + classic branch protection into one summary. Best effort:
     on private repos without a paid plan neither exists, and that is fine."""
@@ -302,7 +307,7 @@ def fetch_rules(repo: str, base: str) -> dict:
             elif t == "copilot_code_review":
                 rules["copilot_review"] = {"review_on_push": bool(p.get("review_on_push")),
                                            "review_drafts": bool(p.get("review_draft_pull_requests"))}
-            elif t:
+            elif t and t not in IRRELEVANT_RULES:
                 rules["other"].append(t)
     ok, prot = rest(f"repos/{repo}/branches/{base}/protection")
     if ok and isinstance(prot, dict):
@@ -320,6 +325,12 @@ def fetch_rules(repo: str, base: str) -> dict:
     if rules["allowed_methods"] is not None:
         rules["allowed_methods"] = sorted(rules["allowed_methods"])  # JSON-safe
     return rules
+
+
+def in_history(repo: str, base: str, sha: str) -> bool:
+    """True when commit `sha` is in `base`'s history (i.e. an ancestor of it)."""
+    ok, data = rest(f"repos/{repo}/compare/{sha}...{base}")
+    return ok and isinstance(data, dict) and data.get("status") in ("ahead", "identical")
 
 
 def behind_by(repo: str, base: str, head_sha: str) -> int | None:
@@ -568,15 +579,17 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
     ar = commits_after_review(pr, (latest.get("commit") or {}).get("oid"))
     base = {"verdict": verdict, "review_url": latest.get("url"), "after_review": ar}
     if unresolved:
-        return {**base, "status": "unhandled", "detail": f"{label}: {len(unresolved)} unresolved Copilot thread(s)"}
+        return {**base, "status": "unhandled",
+                "detail": f"{label}: {len(unresolved)} unresolved Copilot thread(s)" + after_review_text(ar)}
     needs_answer = verdict == "blue" or (verdict == "yellow" and not latest_has_threads)
     if needs_answer:
         what = "blue (Needs a closer look)" if verdict == "blue" else "yellow (Changes recommended) without inline threads"
         if not candidates:
-            return {**base, "status": "unhandled", "detail": f"{what}: nobody has commented since the review"}
+            return {**base, "status": "unhandled", "detail": f"{what}: nobody has commented since the review" + after_review_text(ar)}
         if not confirmed:
             return {**base, "status": "confirm", "candidates": candidates,
-                    "detail": f"{what}: {len(candidates)} comment(s) since the review; ask the user whether it is resolved"}
+                    "detail": f"{what}: {len(candidates)} comment(s) since the review; ask the user whether it is resolved"
+                              + after_review_text(ar)}
         return {**base, "status": "ok", "detail": f"{label}, confirmed resolved by the user" + after_review_text(ar)}
     return {**base, "status": "ok", "detail": f"{label}, handled" + after_review_text(ar)}
 
@@ -733,14 +746,15 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     if res["blockers"]:
         res["next"] = "skip"
         return res
+    behind = ctx.get("behind", {}).get(pr["number"])
+    res["gates"]["up_to_date"] = {"behind_by": behind}
     if cp["status"] == "confirm":
         # Everything else is fine; only the user can say whether the comments
         # after the blue/yellow review actually resolve it.
+        res["update_method"] = cfg.get("update", "merge")
         res["next"] = "confirm"
         return res
 
-    behind = ctx.get("behind", {}).get(pr["number"])
-    res["gates"]["up_to_date"] = {"behind_by": behind}
     needs_update = cfg.get("update") != "none" and (behind is None or behind > 0 or pr.get("mergeStateStatus") == "BEHIND")
     upd = cfg.get("update", "merge")
     risk = rebase_risk(pr) if upd == "rebase" else None
@@ -778,7 +792,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
 MERGE_OF_BASE = r"^Merge (remote-tracking )?branch '(origin/)?{base}'"
 
 
-def classify_head_change(compare: dict, base: str) -> dict:
+def classify_head_change(compare: dict, base: str, in_base=None) -> dict:
     """compare = REST compare <approved head>...<current head>. Returns
     {"kind": "rewritten"} (force-push: the approved head isn't an ancestor),
     {"kind": "merges_only", "count": n} (only merges of the base were added,
@@ -790,7 +804,13 @@ def classify_head_change(compare: dict, base: str) -> dict:
     new, merges = [], 0
     for c in compare.get("commits") or []:
         msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0] if c.get("commit") else ""
-        if len(c.get("parents") or []) > 1 and pat.match(msg):
+        parents = [p.get("sha") for p in (c.get("parents") or [])]
+        # A merge of the base: a merge commit one of whose other parents is in the
+        # base's history. Decided from the parents (in_base), whatever the message
+        # says; the standard git message is only the fallback without a lookup.
+        is_base_merge = len(parents) > 1 and (
+            any(in_base(p) for p in parents[1:]) if in_base else bool(pat.match(msg)))
+        if is_base_merge:
             merges += 1
         else:
             new.append(msg or c.get("sha", "?")[:7])
@@ -917,7 +937,7 @@ def cmd_status(a) -> int:
             continue
         ok, cmp_ = rest(f"repos/{repo}/compare/{want}...{r['head_sha']}")
         if ok and isinstance(cmp_, dict):
-            change = classify_head_change(cmp_, base)
+            change = classify_head_change(cmp_, base, in_base=lambda sha: in_history(repo, base, sha))
         else:
             change = {"kind": "unverified", "error": str(cmp_).strip().splitlines()[0][:160] if cmp_ else "no response"}
         apply_head_change(r, want, change)
@@ -1012,7 +1032,7 @@ def why_text(r: dict) -> str:
     g = r.get("gates", {})
     bits = []
     cp = g.get("copilot")
-    if cp and cp.get("status") != "n/a":
+    if cp and cp.get("status") not in ("n/a", "pending", "missing", "unhandled"):  # those are already blockers
         bits.append(f"Copilot {COLOR.get(cp.get('verdict') or '', '')} {cp['detail']}".replace("  ", " "))
     ck = g.get("checks")
     if ck:
@@ -1037,8 +1057,12 @@ def plan_text(r: dict, base: str, later: bool) -> str:
     if nxt == "update" or (later and r.get("update_method") != "none" and nxt in ("merge", "wait_checks")):
         when = " (after the PRs above land)" if later else ""
         return f"{up}{when}, wait for CI, merge"
-    return {"wait_checks": "wait for CI, merge", "merge": "merge",
-            "confirm": f"ASK YOU first (Copilot), then {up}, CI, merge", "skip": "skip"}.get(nxt, nxt)
+    if nxt == "confirm":
+        behind = (r.get("gates", {}).get("up_to_date") or {}).get("behind_by")
+        needs_up = r.get("update_method") != "none" and (later or behind is None or behind > 0)
+        when = " (after the PRs above land)" if later else ""
+        return "ASK YOU first (Copilot), then " + (f"{up}{when}, CI, merge" if needs_up else "merge")
+    return {"wait_checks": "wait for CI, merge", "merge": "merge", "skip": "skip"}.get(nxt, nxt)
 
 
 def print_brief(out: dict) -> None:
@@ -1125,6 +1149,13 @@ def print_brief(out: dict) -> None:
             print(f"- **#{r['number']}** {g['verdict']} review: {g.get('review_url')}")
             for cand in g.get("candidates", []):
                 print(f"  - comment by @{cand['author']}: {cand['url']}")
+            ar = g.get("after_review") or {}
+            own = (ar.get("commits") or 0) - (ar.get("merges") or 0)
+            if ar.get("rewritten"):
+                print("  - **Note:** the reviewed commit is no longer in the PR: Copilot hasn't seen the code as it is now.")
+            elif own > 0:
+                print(f"  - **Note:** {own} new commit(s) arrived after the review, and Copilot hasn't seen them."
+                      " Confirming the review also accepts them.")
     # Same cause, said once: PRs that can't be rebased for the same reason.
     by_cause: dict[str, list[int]] = {}
     for r in out["queue"]:
