@@ -665,3 +665,34 @@ class FifthRun(unittest.TestCase):
         self.assertIn("update with main", mq.plan_text(r, "main", later=True))
         r = mq.evaluate_pr(self.blue_with_late_commit(), ctx(behind={655: 2}))
         self.assertIn("update with main", mq.plan_text(r, "main", later=False))
+
+
+class SixthRun(unittest.TestCase):
+    """Sixth live run (neve): no open PRs at all."""
+
+    run_status = FieldTest.run_status
+
+    def test_empty_repo_says_nothing_to_do(self):
+        text = self.run_status([], fmt="brief")
+        self.assertIn("0 open PR(s) seen", text)
+        self.assertIn("nothing to do", text)
+        self.assertNotIn("Reply to go ahead", text)
+        self.assertNotIn("| PR | Title |", text)
+
+    def test_only_skipped_or_excluded_needs_no_go(self):
+        p = [pr(number=652), pr(number=653, author=BOB)]  # no Copilot review; other author
+        text = self.run_status(p, fmt="brief")
+        self.assertIn("2 open PR(s) seen:** 0 can go now, 1 will be skipped, 1 out of the queue", text)
+        self.assertIn("No PR can go right now", text)
+        self.assertNotIn("Reply to go ahead", text)
+
+    def test_counts_and_go_line_when_something_can_go(self):
+        text = self.run_status([pr(number=1, reviews=conn(review(GREEN)))], fmt="brief")
+        self.assertIn("1 open PR(s) seen:** 1 can go now, 0 will be skipped, 0 out of the queue", text)
+        self.assertTrue(text.rstrip().endswith("Reply to go ahead."))
+
+    def test_strict_rule_is_named(self):
+        payload = [{"type": "required_status_checks", "parameters": {
+            "strict_required_status_checks_policy": True, "required_status_checks": [{"context": "checks-pass"}]}}]
+        text = self.run_status([pr(reviews=conn(review(GREEN)))], fmt="brief", rules_payload=payload)
+        self.assertIn("branch must be up to date with `main` before merging", text)

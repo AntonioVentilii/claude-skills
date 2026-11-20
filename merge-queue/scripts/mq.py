@@ -1086,7 +1086,11 @@ def print_brief(out: dict) -> None:
                      else "; it doesn't re-review after a push") + ")")
         copilot = used
     rules = out["rules"]
+    q, ex = out["queue"], out["excluded"]
+    goers = [r for r in q if r["next"] in ("merge", "wait_checks", "update", "confirm")]
     print(f"## Merge queue: {out['repo']}\n")
+    print(f"**{len(q) + len(ex)} open PR(s) seen:** {len(goers)} can go now, {len(q) - len(goers)} will be skipped,"
+          f" {len(ex)} out of the queue.\n")
     print("### Settings")
     print(f"- **Which PRs:** {author}, targeting the default branch `{out['base']}` only. Release PRs are never touched.")
     print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
@@ -1112,6 +1116,8 @@ def print_brief(out: dict) -> None:
         req.append("all conversations resolved")
     if rules.get("required_checks"):
         req.append("required checks: " + ", ".join(rules["required_checks"]))
+    if rules.get("strict_up_to_date"):
+        req.append(f"branch must be up to date with `{out['base']}` before merging")
     print("- **Branch rules found:** " + ("; ".join(req) if req else "none (nothing enforced by GitHub, the queue's own gates still apply)") + ".")
     if rules.get("other"):
         print("- **Other branch rules** (GitHub enforces them; the queue doesn't check them itself, a merge they block"
@@ -1131,6 +1137,9 @@ def print_brief(out: dict) -> None:
     print("4. No merge conflicts.")
     print("5. After the update, every check is green (a failure is reported, not retried).")
     print("\n### What will happen")
+    if not q and not ex:
+        print(f"No open PRs in {out['repo']}: nothing to do. Nothing will be changed.")
+        return
     print("| PR | Title | Plan | Why |")
     print("|---|---|---|---|")
     first_go = True
@@ -1173,7 +1182,10 @@ def print_brief(out: dict) -> None:
             print(f"- Merging #{r['number']} moves " + ", ".join(f"#{n}" for n in r["dependents"])
                   + f" onto `{out['base']}` (if its branch is deleted on merge), still carrying #{r['number']}'s original"
                   " commits, which can conflict after a squash. They stay out of this run.")
-    if asks:
+    if not goers:
+        print("\nNo PR can go right now: nothing to approve, and nothing will be changed."
+              + (" Answer the Copilot questions above to unblock those PRs." if asks else ""))
+    elif asks:
         print("\nReply to go ahead, and say which of the Copilot reviews above are resolved.")
     else:
         print("\nReply to go ahead.")

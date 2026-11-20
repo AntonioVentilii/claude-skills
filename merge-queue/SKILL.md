@@ -76,6 +76,9 @@ showing it, keeping it schematic and plain. Someone who doesn't know GitHub inte
 should understand what will happen. Don't add prose around it.
 
 Then **stop and wait for the user's go-ahead.** Nothing is changed before it.
+If the briefing says no PR can go (no open PRs, or every one is skipped or out
+of the queue), there is nothing to approve: present it as the final answer,
+with what would unblock the skipped ones, and stop.
 Skip the wait only if the invocation already said so ("go", "senza chiedere",
 "don't ask").
 
