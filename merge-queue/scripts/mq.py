@@ -35,7 +35,13 @@ CONFIG_PATH = os.path.join(SKILL_DIR, "config", "repos.json")
 DEFAULTS: dict = {
     "author": "me",  # "me" | "all" | ["login", ...]
     "copilot": "auto",  # "auto" | "required" | "off"
-    "update": "rebase",  # "rebase" | "merge" | "none"
+    # How a PR behind the base is brought up to date, like GitHub's "Update
+    # branch" button: "merge" = "Update with merge commit", the button's
+    # default (gh pr update-branch N); "rebase" = "Update with rebase", opt-in
+    # (--rebase); "none" = don't update. GitHub has no repo setting for the
+    # button's method (the UI only remembers each user's last pick), so the
+    # default follows GitHub's default.
+    "update": "merge",
     "method": "squash",  # "squash" | "merge" | "rebase"
     "exclude_labels": [
         "do-not-merge", "do not merge", "dont-merge", "wip", "work in progress",
@@ -665,7 +671,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     behind = ctx.get("behind", {}).get(pr["number"])
     res["gates"]["up_to_date"] = {"behind_by": behind}
     needs_update = cfg.get("update") != "none" and (behind is None or behind > 0 or pr.get("mergeStateStatus") == "BEHIND")
-    upd = cfg.get("update", "rebase")
+    upd = cfg.get("update", "merge")
     risk = rebase_risk(pr) if upd == "rebase" else None
     if risk:
         res["rebase_risk"] = risk
@@ -853,8 +859,8 @@ def why_text(r: dict) -> str:
 
 
 def update_phrase(r: dict, base: str) -> str:
-    return {"rebase": f"rebase on {base}", "merge": f"merge {base} into it", "none": "no update"}.get(
-        r.get("update_method") or "rebase", f"rebase on {base}")
+    return {"rebase": f"update with rebase on {base}", "merge": f"update with {base} via a merge commit",
+            "none": "no update"}.get(r.get("update_method") or "merge", f"update with {base} via a merge commit")
 
 
 def plan_text(r: dict, base: str, later: bool) -> str:
@@ -874,8 +880,10 @@ def print_brief(out: dict) -> None:
     c = out["config"]
     author = {"me": f"only PRs opened by you (@{out['viewer']})", "all": "PRs by anyone"}.get(
         c["author"] if isinstance(c["author"], str) else "", None) or "PRs by " + ", ".join("@" + x for x in c["author"])
-    update = {"rebase": f"rebase it on `{out['base']}` (done by GitHub, not locally)",
-              "merge": f"merge `{out['base']}` into it", "none": "do not update it"}[c["update"]]
+    update = {"rebase": f"if it's behind `{out['base']}`, GitHub's **Update branch → Update with rebase** (set for this repo)",
+              "merge": f"if it's behind `{out['base']}`, GitHub's **Update branch** button with its default, "
+                       "**Update with merge commit**",
+              "none": "do not update it"}[c["update"]]
     cp_mode = out["copilot_mode"]
     if cp_mode == "off":
         copilot = "ignored in this repo"
@@ -889,6 +897,9 @@ def print_brief(out: dict) -> None:
     print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
     print(f"- **Copilot review:** {copilot}.")
     print(f"- **Before merging:** {update}, then wait for **all** checks to be green.")
+    if c["update"] == "merge" and out.get("merge_method") == "rebase":
+        print("- **Note:** the update adds a merge commit, and GitHub may refuse **Rebase and merge** on a branch"
+              " with merge commits: consider `\"update\": \"rebase\"` for this repo.")
     if c["update"] == "rebase":
         if c.get("rebase_fallback", "merge") == "merge" and out.get("merge_method") == "squash":
             print(f"- **If a rebase can't work:** merge `{out['base']}` into the PR instead. Safe here because the final"

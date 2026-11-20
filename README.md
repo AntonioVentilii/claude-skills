@@ -17,8 +17,8 @@ into `~/.claude/skills/` so Claude Code loads it locally.
 - **`merge-queue/`** — a merge queue for repos without GitHub's native one
   (personal repos, private repos on Free/Team). PRs into the default branch
   only, oldest-first, one at a time: ready-for-review → Copilot review handled
-  (green/blue/yellow; blue ones confirmed with you) → approvals → rebase on
-  main → CI green → merge (squash, direct by default; auto-merge opt-in).
+  (green/blue/yellow; blue ones confirmed with you) → approvals → update with
+  main (GitHub's Update branch, merge commit by default) → CI green → merge (squash, direct by default; auto-merge opt-in).
   Shows a briefing and waits for a go-ahead first, then touches only the PRs
   you approved; skips anything not ready, ignores release PRs, ends with a
   report. Default: only your PRs. Per-repo defaults in

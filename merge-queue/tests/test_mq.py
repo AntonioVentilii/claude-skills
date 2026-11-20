@@ -378,9 +378,18 @@ def carried(*merged_pr_numbers, merge_commit=False):
 
 class SecondRun(unittest.TestCase):
     """Second live run on neve: six retargeted PRs failed `update-branch --rebase`
-    because they still carried #100's commits, already squash-merged into main."""
+    because they still carried #100's commits, already squash-merged into main.
+    Rebase updates are opt-in now (`"update": "rebase"`); these tests cover that path."""
 
-    run_status = FieldTest.run_status
+    REBASE = {"update": "rebase"}
+
+    def run_status(self, prs, fmt="json", cfg_extra=None, **kw):
+        return FieldTest.run_status(self, prs, fmt=fmt, cfg_extra={**self.REBASE, **(cfg_extra or {})}, **kw)
+
+    def rctx(self, **kw):
+        c = ctx(**kw)
+        c["cfg"]["update"] = "rebase"
+        return c
 
     def neve(self):
         p101 = pr(number=101, reviews=conn(review(GREEN)))
@@ -396,17 +405,17 @@ class SecondRun(unittest.TestCase):
         self.assertEqual(mq.rebase_risk(pr(prCommits=carried(merge_commit=True)))["merge_commits"], 1)
 
     def test_predicted_conflict_switches_to_merge_update(self):
-        c = ctx(behind={102: 3}, merge_method="squash")
+        c = self.rctx(behind={102: 3}, merge_method="squash")
         r = mq.evaluate_pr(pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100)), c)
         self.assertEqual((r["next"], r["update_method"]), ("update", "merge"))
         self.assertIn("#100", r["rebase_risk"]["reason"])
 
     def test_no_fallback_without_squash_or_when_disabled(self):
         p = pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100))
-        r = mq.evaluate_pr(p, ctx(behind={102: 3}, merge_method="rebase"))
+        r = mq.evaluate_pr(p, self.rctx(behind={102: 3}, merge_method="rebase"))
         self.assertEqual(r["next"], "skip")
         self.assertIn("rebase would conflict", " ".join(r["blockers"]))
-        c = ctx(behind={102: 3}, merge_method="squash")
+        c = self.rctx(behind={102: 3}, merge_method="squash")
         c["cfg"]["rebase_fallback"] = "skip"
         self.assertEqual(mq.evaluate_pr(p, c)["next"], "skip")
 
@@ -418,11 +427,41 @@ class SecondRun(unittest.TestCase):
         self.assertEqual(q[102]["update_method"], "merge")
         text = self.run_status(self.neve(), fmt="brief")
         row102 = [l for l in text.splitlines() if l.startswith("| [#102]")][0]
-        self.assertIn("merge main into it", row102)
-        self.assertNotIn("rebase on main", row102)
+        self.assertIn("update with main via a merge commit", row102)
+        self.assertNotIn("rebase", row102.split("|")[3])
 
     def test_common_cause_said_once(self):
         text = self.run_status(self.neve(), fmt="brief")
         self.assertEqual(text.count("carries the original commits of #100"), 1)
         self.assertIn("#102, #103: carries the original commits of #100", text)
         self.assertIn("If a rebase can't work", text)
+
+
+
+class UpdateBranchDefault(unittest.TestCase):
+    """Updating = GitHub's "Update branch" button with its default method,
+    "Update with merge commit" (gh pr update-branch N, no --rebase)."""
+
+    run_status = FieldTest.run_status
+
+    def test_default_is_merge_commit(self):
+        self.assertEqual(mq.DEFAULTS["update"], "merge")
+        r = mq.evaluate_pr(pr(reviews=conn(review(GREEN))), ctx(behind={1: 2}))
+        self.assertEqual((r["next"], r["update_method"]), ("update", "merge"))
+
+    def test_carried_commits_dont_matter_for_merge_update(self):
+        # Only a rebase replays commits: the merge-commit update just merges main in.
+        r = mq.evaluate_pr(pr(reviews=conn(review(GREEN)), prCommits=carried(100)), ctx(behind={1: 2}))
+        self.assertNotIn("rebase_risk", r)
+        self.assertEqual(r["update_method"], "merge")
+
+    def test_brief_names_the_button(self):
+        import json
+        p = [pr(number=101, reviews=conn(review(GREEN))), pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100))]
+        text = self.run_status(p, fmt="brief")
+        self.assertIn("Update branch", text)
+        self.assertIn("Update with merge commit", text)
+        self.assertNotIn("Why some PRs can't be rebased", text)
+        self.assertNotIn("If a rebase can't work", text)
+        out = json.loads(self.run_status(p))
+        self.assertEqual({r["update_method"] for r in out["queue"]}, {"merge"})

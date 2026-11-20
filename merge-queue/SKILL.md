@@ -5,8 +5,9 @@ description: >-
   private repos on Free/Team plans). Takes the open PRs into the default branch
   (main/master), oldest first, one at a time: checks the gates (ready for
   review, Copilot review arrived and handled per its green/blue/yellow verdict,
-  required approvals, no conflicts, no hold labels), rebases on the default
-  branch, waits for all CI to go green, then merges it directly (squash by
+  required approvals, no conflicts, no hold labels), updates it with the
+  default branch like GitHub's "Update branch" button (merge commit, GitHub's
+  default), waits for all CI to go green, then merges it directly (squash by
   default; GitHub auto-merge only if configured). Any PR failing a gate is skipped with a reason, never fixed.
   Release PRs are left out. Before touching anything it shows a schematic
   briefing of what it will do and which rules apply, and waits for a go-ahead.
@@ -38,7 +39,7 @@ then whatever the user said overrides them. Map their words to flags:
 | "mine" / "all" / "@alice,@bob" | `--author me\|all\|alice,bob` | `me`: only PRs opened by the person running the skill (the `gh`-authenticated user) |
 | "#12 #15 #9" (explicit PRs, in that order) | `--pr 12 15 9` | all open PRs |
 | "no copilot" / "copilot required" | `--copilot off\|required` | `auto` (detected from repo history) |
-| "don't update" / "update with merge" | `--update none\|merge` | `rebase` |
+| "don't update" / "update with rebase" | `--update none\|rebase` | `merge`: GitHub's **Update branch** button with its default, *Update with merge commit* |
 | "merge commit" / "rebase merge" | `--method merge\|rebase` | `squash` (falls back to what the repo allows) |
 | "dry run" / "just check" / "report only" | none: stop after the briefing | off |
 
@@ -134,11 +135,16 @@ In order, for each PR. Any failure → `next: skip` with the reason in `blockers
 5. **No conflicts** with the default branch. Only `MERGEABLE` passes: while
    GitHub is still computing it (`UNKNOWN`) the script retries a few times,
    then skips with "re-run shortly".
-6. **Up to date** (`--update rebase` by default): if behind, `next: update`.
+6. **Up to date**: if behind, `next: update`. "Update" means what GitHub's
+   **Update branch** button does, with GitHub's default method, *Update with
+   merge commit* (`gh pr update-branch N`). GitHub has no repo setting for
+   that method (the UI only remembers each user's last pick), so the skill
+   uses GitHub's default. *Update with rebase* (`--rebase`) is used only when
+   the repo's config says `"update": "rebase"`.
    Then CI must pass on the new head before merging: every check green,
    GitHub's aggregate check state not worse, and every check the branch rules
    require actually reported.
-   **"Mergeable" doesn't mean "rebaseable".** GitHub's conflict check is a
+   **With `"update": "rebase"` only — "mergeable" doesn't mean "rebaseable".** GitHub's conflict check is a
    merge. A rebase replays the PR's commits one by one, and it conflicts when
    the PR still carries commits of another PR that was already squash-merged
    (typically a PR that was stacked on it), or when the PR has merge commits.
@@ -168,7 +174,7 @@ act on that fresh `next`:
 ```bash
 # a. update (server-side; never rebase/force-push locally)
 OLD=$(gh pr view N --json headRefOid -q .headRefOid)
-gh pr update-branch N --rebase          # --rebase only when update_method is "rebase"
+gh pr update-branch N                   # add --rebase only when update_method is "rebase"
 # b. wait for CI on the new head. One call waits up to ~9 min; repeat while it
 #    exits 2, until wait_timeout_minutes (config, default 45) is used up.
 python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
@@ -184,8 +190,8 @@ python3 SKILL/scripts/mq.py wait-merged --pr N --timeout-sec 180
 
 How to read each step:
 
-- **a.** Use the PR's `update_method` from the fresh `status`: `--rebase`
-  for `rebase`, no flag for `merge`. If a rebase fails with `rebase conflict
+- **a.** Use the PR's `update_method` from the fresh `status`: no flag for
+  `merge` (the default, like the Update branch button), `--rebase` for `rebase`. If a rebase fails with `rebase conflict
   between base and head` that the script didn't predict, and the snapshot has
   `merge_method: squash` and `rebase_fallback: merge`, run
   `gh pr update-branch N` (merge) **once** and say so in the report.
@@ -202,7 +208,7 @@ How to read each step:
   (in `merge_mode: auto` only, arm auto-merge instead and record "auto-merge
   armed, CI still running").
 - **c.** It must say `next: merge` again. Things that can change it: a Copilot
-  re-review triggered by the rebase may have landed (yellow, new threads, or a
+  re-review triggered by the update may have landed (yellow, new threads, or a
   new blue that needs asking → skip and report it), stale approvals may have
   been dismissed, or the base may have moved again (`update` → back to a; at
   most 3 cycles per PR, then skip as "base keeps moving").
@@ -256,14 +262,14 @@ Write it in the language the user invoked the skill in. Keep it scannable:
 
 ```markdown
 ## Merge queue: owner/repo → main
-squash · rebase-update · only @you · Copilot: used · 6 in queue, 2 excluded
+squash · update: merge commit · only @you · Copilot: used · 6 in queue, 2 excluded
 
 | PR | Title | Result | Why / next step |
 |---|---|---|---|
-| #12 | feat: x | ✅ merged | rebased, 7 checks green |
+| #12 | feat: x | ✅ merged | updated with main, 7 checks green |
 | #14 | fix: y | ❓ not confirmed | 🔵 Copilot [review](url): comment [by @you](url), not confirmed resolved |
 | #15 | chore: z | ⏭ skipped | needs 1 approving review (has 0) |
-| #16 | feat: w | ❌ CI failed | `test (node 20)` failed after rebase ([run](url)) |
+| #16 | feat: w | ❌ CI failed | `test (node 20)` failed after the update ([run](url)) |
 | #17 | feat: v | ⏸ not merged | merge refused: waiting on required check `e2e` |
 | #18 | docs: u | ⏭ skipped | no Copilot review, none requested |
 
@@ -272,7 +278,7 @@ Excluded: #10 `chore(main): release 2.3.0` (release PR) · #11 by @bob (only you
 ### To unblock
 - #14: confirm the Copilot review is resolved (or answer it), then re-run.
 - #15: needs an approval from someone other than you.
-- #16: `test (node 20)` fails on top of current main. Likely needs a rebase fix.
+- #16: `test (node 20)` fails on top of current main. Likely needs a fix for the latest main.
 - #18: request a Copilot review if you want it in the queue.
 ```
 
@@ -292,7 +298,8 @@ as a separate task, and offering to re-run the queue later.
 themselves: e.g. a repo without Copilot (`"copilot": "off"`), one that uses
 merge commits (`"method": "merge"`), one that doesn't need updating
 (`"update": "none"`), GitHub auto-merge instead of direct merges
-(`"auto_merge": true`, off by default), what to do when a rebase can't work
+(`"auto_merge": true`, off by default), *Update with rebase* instead of GitHub's default
+merge commit (`"update": "rebase"`), and with it what to do when a rebase can't work
 (`"rebase_fallback": "merge"`, the default, or `"skip"`), extra release patterns, or bots whose comments are shown
 as candidate answers to a Copilot review (`addressing_bots`). When the user
 states a lasting preference for a repo ("in this repo we never use Copilot"),
