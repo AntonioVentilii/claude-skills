@@ -25,7 +25,8 @@ can't run here.
   only, only the approved PRs, direct merge unless `auto_merge: true`, never
   request Copilot, ask the user about blue reviews (with links).
 - **No rebase update.** `update_pull_request_branch` only merges the base into
-  the branch. With `update: rebase` (the default), tell the user the update
+  the branch. (Rebase risk can't be predicted here either: there's no per-commit
+  PR lookup, so say so in the briefing.) With `update: rebase` (the default), tell the user the update
   will be a merge commit instead, and proceed only if they agree, or use
   `update: none` for this run.
 - **No branch-rules endpoint.** Infer required approvals from

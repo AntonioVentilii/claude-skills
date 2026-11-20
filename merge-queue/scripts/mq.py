@@ -64,6 +64,11 @@ DEFAULTS: dict = {
     # auto-merge (`gh pr merge --auto`) where the repo allows it. Opt-in only:
     # many users forbid --auto in their own instructions.
     "auto_merge": False,
+    # When a rebase can't work (the PR carries commits already squash-merged
+    # into the base, e.g. a PR that was stacked on one merged before it):
+    # "merge" = update by merging the base in instead (only when the final
+    # merge is a squash, so no merge commit reaches the base), "skip" = skip it.
+    "rebase_fallback": "merge",
 }
 
 COPILOT_RE = re.compile(r"^(copilot-pull-request-reviewer(\[bot\])?|copilot)$", re.I)
@@ -134,6 +139,8 @@ reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on Actor 
 reviews(last: 100) { totalCount nodes { id url author { login __typename } state body submittedAt } }
 comments(last: 100) { nodes { url author { login __typename } createdAt } }
 reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
+prCommits: commits(first: 100) { totalCount nodes { commit { oid parents { totalCount }
+  associatedPullRequests(first: 5) { nodes { number merged } } } } }
 commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { totalCount nodes {
   __typename
   ... on CheckRun { name status conclusion detailsUrl }
@@ -497,6 +504,32 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
     return {**base, "status": "ok", "detail": f"{label}, handled"}
 
 
+def rebase_risk(pr: dict) -> dict | None:
+    """Predict a server-side rebase conflict. A PR's commit list only holds
+    commits that aren't in the base yet; if some of them belong to ANOTHER,
+    already merged PR, that PR was squash- or rebase-merged, so its changes
+    are in the base under different commits and replaying them conflicts.
+    Merge commits in the PR are another usual cause."""
+    merged: set[int] = set()
+    merge_commits = 0
+    for n in nodes(pr.get("prCommits")):
+        c = n.get("commit") or {}
+        if ((c.get("parents") or {}).get("totalCount") or 1) > 1:
+            merge_commits += 1
+        for ap in nodes(c.get("associatedPullRequests")):
+            if ap.get("merged") and ap.get("number") != pr.get("number"):
+                merged.add(ap["number"])
+    if not merged and not merge_commits:
+        return None
+    bits = []
+    if merged:
+        bits.append("carries the original commits of " + ", ".join(f"#{n}" for n in sorted(merged))
+                    + ", already merged into the base as different commits")
+    if merge_commits:
+        bits.append(f"contains {merge_commits} merge commit(s)")
+    return {"merged_prs": sorted(merged), "merge_commits": merge_commits, "reason": "; ".join(bits)}
+
+
 def eval_approvals(pr: dict, rules: dict) -> dict:
     latest_by: dict[str, str] = {}
     for r in sorted(nodes(pr.get("reviews")), key=lambda r: ts(r.get("submittedAt"))):
@@ -631,7 +664,25 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
 
     behind = ctx.get("behind", {}).get(pr["number"])
     res["gates"]["up_to_date"] = {"behind_by": behind}
-    if cfg.get("update") != "none" and (behind is None or behind > 0 or pr.get("mergeStateStatus") == "BEHIND"):
+    needs_update = cfg.get("update") != "none" and (behind is None or behind > 0 or pr.get("mergeStateStatus") == "BEHIND")
+    upd = cfg.get("update", "rebase")
+    risk = rebase_risk(pr) if upd == "rebase" else None
+    if risk:
+        res["rebase_risk"] = risk
+        can_fallback = cfg.get("rebase_fallback", "merge") == "merge" and ctx.get("merge_method", "squash") == "squash"
+        if can_fallback:
+            upd = "merge"
+            res["warnings"].append("rebase would conflict (see below): will merge the base in instead")
+        elif needs_update:
+            res["blockers"].append("rebase would conflict: " + risk["reason"]
+                                   + " (fix the branch, or allow `rebase_fallback: merge` with squash merges)")
+            res["update_method"] = "rebase"
+            res["next"] = "skip"
+            return res
+        else:
+            res["warnings"].append("a rebase would conflict if the base moves: " + risk["reason"])
+    res["update_method"] = upd
+    if needs_update:
         if pr.get("isCrossRepository") and not pr.get("maintainerCanModify"):
             res["blockers"].append(f"behind `{ctx['base']}` by {behind} and branch cannot be updated (fork)")
             res["next"] = "skip"
@@ -695,7 +746,8 @@ def cmd_status(a) -> int:
             time.sleep(delay)
             pr = prs[i] = fetch_one(repo, pr["number"])
     uses = cfg.get("copilot") == "auto" and repo_uses_copilot(repo, prs)
-    ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses,
+    method, method_note = choose_method(meta, rules, cfg.get("method", "squash"))
+    ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses, "merge_method": method,
            "explicit": bool(a.pr), "behind": {}, "confirmed": set(a.confirmed or [])}
 
     # First pass without behind info, then compute behind only for PRs still in play.
@@ -721,7 +773,6 @@ def cmd_status(a) -> int:
                 "base of open PR(s) " + ", ".join(f"#{n}" for n in deps) + ": merging it retargets them to "
                 f"`{base}` (if its branch is deleted on merge) with its original commits; they are NOT part of this run")
 
-    method, method_note = choose_method(meta, rules, cfg.get("method", "squash"))
     perm = meta.get("viewerPermission")
     notes = []
     if perm not in ("WRITE", "MAINTAIN", "ADMIN"):
@@ -739,7 +790,7 @@ def cmd_status(a) -> int:
         "delete_branch_on_merge": meta.get("deleteBranchOnMerge"),
         "merge_method": method, "merge_method_note": method_note,
         "copilot_mode": cfg.get("copilot"), "repo_uses_copilot": uses if cfg.get("copilot") == "auto" else None,
-        "config": {k: cfg[k] for k in ("author", "copilot", "update", "method", "wait_timeout_minutes", "auto_merge")},
+        "config": {k: cfg.get(k) for k in ("author", "copilot", "update", "method", "wait_timeout_minutes", "auto_merge", "rebase_fallback")},
         "rules": rules, "notes": notes,
         "queue": [r for r in results if r["next"] != "excluded"],
         "excluded": [{"number": r["number"], "title": r["title"], "author": r["author"], "reason": r["excluded"]} for r in results if r["next"] == "excluded"],
@@ -801,13 +852,20 @@ def why_text(r: dict) -> str:
     return "; ".join(bits) or "all gates pass"
 
 
-NEXT_LABEL = {
-    "update": "rebase on {base}, wait for CI, merge",
-    "wait_checks": "wait for CI, merge",
-    "merge": "merge",
-    "confirm": "ASK YOU first (Copilot), then rebase, CI, merge",
-    "skip": "skip",
-}
+def update_phrase(r: dict, base: str) -> str:
+    return {"rebase": f"rebase on {base}", "merge": f"merge {base} into it", "none": "no update"}.get(
+        r.get("update_method") or "rebase", f"rebase on {base}")
+
+
+def plan_text(r: dict, base: str, later: bool) -> str:
+    """What will happen to this PR. `later`: PRs before it will have landed."""
+    up = update_phrase(r, base)
+    nxt = r["next"]
+    if nxt == "update" or (later and r.get("update_method") != "none" and nxt in ("merge", "wait_checks")):
+        when = " (after the PRs above land)" if later and nxt != "update" else ""
+        return f"{up}{when}, wait for CI, merge"
+    return {"wait_checks": "wait for CI, merge", "merge": "merge",
+            "confirm": f"ASK YOU first (Copilot), then {up}, CI, merge", "skip": "skip"}.get(nxt, nxt)
 
 
 def print_brief(out: dict) -> None:
@@ -831,6 +889,12 @@ def print_brief(out: dict) -> None:
     print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
     print(f"- **Copilot review:** {copilot}.")
     print(f"- **Before merging:** {update}, then wait for **all** checks to be green.")
+    if c["update"] == "rebase":
+        if c.get("rebase_fallback", "merge") == "merge" and out.get("merge_method") == "squash":
+            print(f"- **If a rebase can't work:** merge `{out['base']}` into the PR instead. Safe here because the final"
+                  " merge is a squash: no merge commit reaches the base.")
+        else:
+            print("- **If a rebase can't work:** the PR is skipped.")
     am = "GitHub auto-merge" if out.get("merge_mode") == "auto" else "a direct merge once everything is green (no auto-merge)"
     print(f"- **Merge:** {out['merge_method_note']}, via {am}.")
     req = []
@@ -862,11 +926,8 @@ def print_brief(out: dict) -> None:
     print("|---|---|---|---|")
     first_go = True
     for r in out["queue"]:
-        plan = NEXT_LABEL.get(r["next"], r["next"]).format(base=out["base"])
+        plan = plan_text(r, out["base"], later=not first_go)
         if r["next"] in ("merge", "wait_checks", "update", "confirm"):
-            if not first_go and c["update"] != "none" and r["next"] in ("merge", "wait_checks"):
-                # The PRs before it will have landed: it will be behind by then.
-                plan = f"rebase on {out['base']} (after the PRs above land), wait for CI, merge"
             first_go = False
         print(f"| [#{r['number']}]({r['url']}) | {r['title']} | {plan} | {why_text(r)} |")
     for e in out["excluded"]:
@@ -879,6 +940,16 @@ def print_brief(out: dict) -> None:
             print(f"- **#{r['number']}** {g['verdict']} review: {g.get('review_url')}")
             for cand in g.get("candidates", []):
                 print(f"  - comment by @{cand['author']}: {cand['url']}")
+    # Same cause, said once: PRs that can't be rebased for the same reason.
+    by_cause: dict[str, list[int]] = {}
+    for r in out["queue"]:
+        if r.get("rebase_risk"):
+            by_cause.setdefault(r["rebase_risk"]["reason"], []).append(r["number"])
+    if by_cause:
+        print("\n### Why some PRs can't be rebased")
+        for reason, nums in by_cause.items():
+            print(f"- " + ", ".join(f"#{n}" for n in nums) + f": {reason}. Replaying those commits on top of"
+                  f" `{out['base']}` conflicts, so GitHub's rebase fails ({'they will be updated by merging the base in instead' if c.get('rebase_fallback', 'merge') == 'merge' and out.get('merge_method') == 'squash' else 'they are skipped'}).")
     deps = [r for r in out["queue"] if r.get("dependents")]
     if deps:
         print("\n### Stacked PRs")

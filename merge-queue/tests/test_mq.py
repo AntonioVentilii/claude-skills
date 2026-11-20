@@ -365,3 +365,64 @@ class FieldTest(unittest.TestCase):
         r = mq.eval_approvals(pr(), {"code_owner_review": True})
         self.assertTrue(r["ok"])
         self.assertIn("code-owner rule exists but doesn't apply", r["detail"])
+
+
+def carried(*merged_pr_numbers, merge_commit=False):
+    """prCommits for a PR that still carries commits of other, merged PRs."""
+    nodes_ = [{"commit": {"oid": f"c{n}", "parents": {"totalCount": 1},
+                          "associatedPullRequests": conn({"number": n, "merged": True})}} for n in merged_pr_numbers]
+    nodes_.append({"commit": {"oid": "own", "parents": {"totalCount": 2 if merge_commit else 1},
+                              "associatedPullRequests": conn()}})
+    return {"totalCount": len(nodes_), "nodes": nodes_}
+
+
+class SecondRun(unittest.TestCase):
+    """Second live run on neve: six retargeted PRs failed `update-branch --rebase`
+    because they still carried #100's commits, already squash-merged into main."""
+
+    run_status = FieldTest.run_status
+
+    def neve(self):
+        p101 = pr(number=101, reviews=conn(review(GREEN)))
+        p102 = pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100))
+        p103 = pr(number=103, reviews=conn(review(GREEN)), prCommits=carried(100))
+        return [p101, p102, p103]
+
+    def test_rebase_risk_detection(self):
+        self.assertIsNone(mq.rebase_risk(pr()))
+        self.assertIsNone(mq.rebase_risk(pr(number=7, prCommits=carried(7))))  # its own PR doesn't count
+        r = mq.rebase_risk(pr(number=102, prCommits=carried(100)))
+        self.assertEqual(r["merged_prs"], [100])
+        self.assertEqual(mq.rebase_risk(pr(prCommits=carried(merge_commit=True)))["merge_commits"], 1)
+
+    def test_predicted_conflict_switches_to_merge_update(self):
+        c = ctx(behind={102: 3}, merge_method="squash")
+        r = mq.evaluate_pr(pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100)), c)
+        self.assertEqual((r["next"], r["update_method"]), ("update", "merge"))
+        self.assertIn("#100", r["rebase_risk"]["reason"])
+
+    def test_no_fallback_without_squash_or_when_disabled(self):
+        p = pr(number=102, reviews=conn(review(GREEN)), prCommits=carried(100))
+        r = mq.evaluate_pr(p, ctx(behind={102: 3}, merge_method="rebase"))
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("rebase would conflict", " ".join(r["blockers"]))
+        c = ctx(behind={102: 3}, merge_method="squash")
+        c["cfg"]["rebase_fallback"] = "skip"
+        self.assertEqual(mq.evaluate_pr(p, c)["next"], "skip")
+
+    def test_rerun_no_longer_repeats_the_failing_plan(self):
+        import json
+        out = json.loads(self.run_status(self.neve()))
+        q = {r["number"]: r for r in out["queue"]}
+        self.assertEqual(q[101]["update_method"], "rebase")
+        self.assertEqual(q[102]["update_method"], "merge")
+        text = self.run_status(self.neve(), fmt="brief")
+        row102 = [l for l in text.splitlines() if l.startswith("| [#102]")][0]
+        self.assertIn("merge main into it", row102)
+        self.assertNotIn("rebase on main", row102)
+
+    def test_common_cause_said_once(self):
+        text = self.run_status(self.neve(), fmt="brief")
+        self.assertEqual(text.count("carries the original commits of #100"), 1)
+        self.assertIn("#102, #103: carries the original commits of #100", text)
+        self.assertIn("If a rebase can't work", text)

@@ -138,6 +138,16 @@ In order, for each PR. Any failure → `next: skip` with the reason in `blockers
    Then CI must pass on the new head before merging: every check green,
    GitHub's aggregate check state not worse, and every check the branch rules
    require actually reported.
+   **"Mergeable" doesn't mean "rebaseable".** GitHub's conflict check is a
+   merge. A rebase replays the PR's commits one by one, and it conflicts when
+   the PR still carries commits of another PR that was already squash-merged
+   (typically a PR that was stacked on it), or when the PR has merge commits.
+   The script spots this (`rebase_risk`) and gives each PR an `update_method`:
+   `rebase`, or `merge` (the base is merged into the PR) for those PRs. That is
+   safe only because the final merge is a squash, so no merge commit reaches
+   the base. With another merge method, or `"rebase_fallback": "skip"`, those
+   PRs are skipped instead. The briefing states the cause once for all the
+   PRs that share it.
 
 The script fails closed: if a PR has more labels or review threads than it can
 read in one go (over 100), it skips the PR and asks for a manual check instead
@@ -158,7 +168,7 @@ act on that fresh `next`:
 ```bash
 # a. update (server-side; never rebase/force-push locally)
 OLD=$(gh pr view N --json headRefOid -q .headRefOid)
-gh pr update-branch N --rebase          # omit --rebase when update=merge
+gh pr update-branch N --rebase          # --rebase only when update_method is "rebase"
 # b. wait for CI on the new head. One call waits up to ~9 min; repeat while it
 #    exits 2, until wait_timeout_minutes (config, default 45) is used up.
 python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
@@ -174,9 +184,14 @@ python3 SKILL/scripts/mq.py wait-merged --pr N --timeout-sec 180
 
 How to read each step:
 
-- **a.** If `update-branch` fails (conflicts the server can't rebase, fork
-  without maintainer edits, or a rule rejects it), skip with that reason. If
-  it says the branch is already up to date, carry on. On success it prints
+- **a.** Use the PR's `update_method` from the fresh `status`: `--rebase`
+  for `rebase`, no flag for `merge`. If a rebase fails with `rebase conflict
+  between base and head` that the script didn't predict, and the snapshot has
+  `merge_method: squash` and `rebase_fallback: merge`, run
+  `gh pr update-branch N` (merge) **once** and say so in the report.
+  Otherwise, or if that fails too (a real conflict), skip with the reason. A
+  fork without maintainer edits, or a rule that rejects the update, means skip.
+  If it says the branch is already up to date, carry on. On success it prints
   "✓ PR branch updated" and exits 0, but the head SHA changes a few seconds
   **later**: that's why b passes `--not-sha $OLD`. Never read the checks right
   after the update without it, or you'd be looking at the old head's CI.
@@ -265,7 +280,9 @@ Legend: ✅ merged · ⏸ not merged (⏳ armed, in auto mode) · ⏭ skipped (g
 ❌ CI failed · ❓ needs your confirmation · 🚫 excluded. After the table, list
 anything that changed around the queue during the run (stacked PRs retargeted,
 PRs that appeared, conflicts that appeared) as "not processed". Include warnings (e.g. unresolved
-human threads that aren't enforced) under the PR's row. End by offering the
+human threads that aren't enforced) under the PR's row. **When several PRs
+share one cause** (e.g. the same rebase conflict), state the cause once
+below the table, with the fix, and keep their rows short ("see below"). End by offering the
 follow-ups that only need you (address Copilot comments on #14, fix CI on #16, …)
 as a separate task, and offering to re-run the queue later.
 
@@ -275,7 +292,8 @@ as a separate task, and offering to re-run the queue later.
 themselves: e.g. a repo without Copilot (`"copilot": "off"`), one that uses
 merge commits (`"method": "merge"`), one that doesn't need updating
 (`"update": "none"`), GitHub auto-merge instead of direct merges
-(`"auto_merge": true`, off by default), extra release patterns, or bots whose comments are shown
+(`"auto_merge": true`, off by default), what to do when a rebase can't work
+(`"rebase_fallback": "merge"`, the default, or `"skip"`), extra release patterns, or bots whose comments are shown
 as candidate answers to a Copilot review (`addressing_bots`). When the user
 states a lasting preference for a repo ("in this repo we never use Copilot"),
 offer to save it there.
