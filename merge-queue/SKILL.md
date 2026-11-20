@@ -203,6 +203,9 @@ before acting on each PR**, because merging the previous PR moved the base, and
 act on that fresh `next`:
 
 - `skip`: record the blockers; go to the next PR.
+- `excluded` with "already merged by …": someone else merged it during the run.
+  Record "✅ merged by someone else" (who and when), drop it from the approved
+  list, and go on. Don't touch it.
 - `confirm`: the user didn't confirm this one → record "Copilot review not
   confirmed resolved", with the links; go to the next PR.
 - `update` → `wait_checks` → `merge`, the head-of-queue loop:
@@ -258,9 +261,15 @@ How to read each step:
   `--admin`. Don't pass `--delete-branch`; the repo's setting decides.
   A direct `gh pr merge` prints **nothing** and exits 0 on success, so don't
   read silence as failure (or success): step e is what confirms it.
-- **e.** Exit 0 means merged: next PR. Exit 2 means it didn't merge (e.g. a
-  required check or review GitHub still enforces). Record "not merged, waiting
-  on <mergeStateStatus>" (or "armed" in auto mode) and go on.
+- **d → a again.** If `gh pr merge` is refused with `Base branch was modified`
+  (exit 1), something landed on the base between c and d: often someone else
+  merging another PR. It is not a failure. Re-run `status`, and when it says
+  `update` go back to a. That counts toward the 3 cycles per PR.
+- **e.** Exit 0 means merged: next PR. Exit 2 means it didn't merge. If
+  `mergeStateStatus` is `BEHIND`, the base moved under the merge: go back to a
+  (same 3-cycle limit). Otherwise (e.g. a required check or review GitHub still
+  enforces), record "not merged, waiting on <mergeStateStatus>" (or "armed" in
+  auto mode) and go on.
 
 **Final sweep (once):** if anything merged and some **approved** PRs were
 skipped only for transient reasons (Copilot not arrived yet, CI still running,
@@ -322,8 +331,9 @@ Excluded: #10 `chore(main): release 2.3.0` (release PR) · #11 by @bob (only you
 - #18: request a Copilot review if you want it in the queue.
 ```
 
-Legend: ✅ merged · ⏸ not merged (⏳ armed, in auto mode) · ⏭ skipped (gate) ·
-❌ CI failed · ❓ needs your confirmation · 🚫 excluded.
+Legend: ✅ merged · ✅ merged by someone else (during the run) · ⏸ not merged
+(⏳ armed, in auto mode) · ⏭ skipped (gate) · ❌ CI failed · ❓ needs your
+confirmation · 🚫 excluded.
 
 - **Fresh numbers.** Take figures like "behind by N" from the `status` you ran
   right before acting on that PR, not from the briefing: they change after

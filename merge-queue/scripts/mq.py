@@ -134,7 +134,7 @@ def current_repo() -> str:
 
 
 PR_FIELDS = """
-number title url isDraft createdAt state merged
+number title url isDraft createdAt state merged mergedAt mergedBy { login }
 author { login __typename }
 baseRefName headRefName headRefOid
 isCrossRepository maintainerCanModify
@@ -756,7 +756,11 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     }
 
     # ---- filters (exclusion = not part of this queue at all) ----
-    if pr.get("merged") or pr.get("state") not in (None, "OPEN"):
+    if pr.get("merged"):
+        by = (pr.get("mergedBy") or {}).get("login")
+        res["merged_elsewhere"] = {"by": by, "at": pr.get("mergedAt"), "head": pr.get("headRefOid")}
+        res["excluded"] = f"already merged" + (f" by @{by}" if by else "") + (f" at {pr['mergedAt']}" if pr.get("mergedAt") else "")
+    elif pr.get("state") not in (None, "OPEN"):
         res["excluded"] = f"not open ({pr.get('state')})"
     rel = is_release_pr(pr, cfg)
     if not res["excluded"] and rel:
@@ -799,6 +803,10 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     res["gates"]["copilot"] = cp
     if cp["status"] in ("pending", "missing", "unhandled"):
         res["blockers"].append("Copilot: " + cp["detail"])
+    hand = ((cp.get("after_review") or {}).get("hand_merges")) or 0
+    if hand:
+        res["warnings"].append(f"{hand} merge(s) of the base with conflicts resolved by hand since the Copilot review:"
+                               " code Copilot hasn't seen")
 
     # ---- 3. approvals ----
     ap = eval_approvals(pr, rules)
@@ -836,11 +844,11 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     if pr.get("autoMergeRequest"):
         res["warnings"].append("auto-merge already enabled (" + (pr["autoMergeRequest"].get("mergeMethod") or "?") + ")")
 
+    behind = ctx.get("behind", {}).get(pr["number"])
+    res["gates"]["up_to_date"] = {"behind_by": behind}
     if res["blockers"]:
         res["next"] = "skip"
         return res
-    behind = ctx.get("behind", {}).get(pr["number"])
-    res["gates"]["up_to_date"] = {"behind_by": behind}
     if cp["status"] == "confirm":
         # Everything else is fine; only the user can say whether the comments
         # after the blue/yellow review actually resolve it.
@@ -1030,7 +1038,7 @@ def cmd_status(a) -> int:
     # First pass without behind info, then compute behind only for PRs still in play.
     prelim = [evaluate_pr(pr, ctx) for pr in prs]
     for pr, r in zip(prs, prelim):
-        if r["next"] in ("update", "merge", "wait_checks", "confirm"):
+        if r["next"] != "excluded":
             ctx["behind"][pr["number"]] = behind_by(repo, base, pr["headRefOid"])
     results = [evaluate_pr(pr, ctx) for pr in prs]
     if not a.pr:
@@ -1174,7 +1182,9 @@ def why_text(r: dict) -> str:
     behind = (g.get("up_to_date") or {}).get("behind_by")
     if behind:
         bits.append(f"behind by {behind} right now")
-    bits += r.get("blockers", []) + r.get("warnings", [])
+    shown = " ".join(bits)
+    bits += r.get("blockers", []) + [w for w in r.get("warnings", [])
+                                     if not ("resolved by hand" in w and "resolved by hand" in shown)]
     return "; ".join(bits) or "all gates pass"
 
 

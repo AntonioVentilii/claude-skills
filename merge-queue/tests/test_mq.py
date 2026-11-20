@@ -873,3 +873,36 @@ class EighthRun(unittest.TestCase):
         self.assertIn("not run inside a clone", " ".join(out["notes"]))
         out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)))], merge_checker=lambda s, p: "clean"))
         self.assertNotIn("not run inside a clone", " ".join(out["notes"]))
+
+
+class NinthRun(unittest.TestCase):
+    """Ninth live run (uliveto): 3 merged by the queue, 1 by someone else mid-run."""
+
+    run_status = FieldTest.run_status
+
+    def test_pr_merged_by_someone_else_is_reported_as_such(self):
+        import json
+        p = [pr(number=668, state="MERGED", merged=True, mergedAt="2026-11-20T20:37:14Z", mergedBy={"login": "antonio"},
+                headRefOid="67717e4aa", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[668], approved_heads=["668=67717e4"]))
+        self.assertEqual(out["queue"], [])
+        ex = out["excluded"][0]
+        self.assertIn("already merged by @antonio at 2026-11-20T20:37:14Z", ex["reason"])
+
+    def test_hand_merges_after_review_are_a_warning(self):
+        rv = {**review(GREEN), "commit": {"oid": "c1"}}
+        commits = {"totalCount": 2, "nodes": [
+            {"commit": {"oid": "c1", "parents": {"totalCount": 1, "nodes": [{"oid": "c0"}]}}},
+            {"commit": {"oid": "r1", "parents": {"totalCount": 2, "nodes": [{"oid": "c1"}, {"oid": "m"}]}}}]}
+        c = ctx(behind={665: 0})
+        c["cfg"]["_merge_checker"] = lambda s, p: "resolved"
+        r = mq.evaluate_pr(pr(number=665, reviews=conn(rv), prCommits=commits), c)
+        self.assertIn("conflicts resolved by hand since the Copilot review", " ".join(r["warnings"]))
+        self.assertEqual(mq.why_text(r).count("resolved by hand"), 1)  # said once in the table
+
+    def test_skipped_prs_still_report_behind(self):
+        import json
+        out = json.loads(self.run_status([pr(number=663)]))  # skipped: no Copilot review
+        r = out["queue"][0]
+        self.assertEqual(r["next"], "skip")
+        self.assertEqual(r["gates"]["up_to_date"]["behind_by"], 0)
