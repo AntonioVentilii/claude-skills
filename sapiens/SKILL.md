@@ -7,7 +7,8 @@ description: >
   restatement, and padding. Dense, not long: to the point AND exhaustive.
   Use when user says "sapiens mode", "/sapiens", "be concise but thorough",
   "to the point but complete", "not too verbose", "less prolisso", "trim
-  the fluff but keep the details".
+  the fluff but keep the details". "/sapiens help", "sapiens help" or "come si
+  usa sapiens" shows how to use it, with an example.
 ---
 
 Write like a sharp engineer who respects the reader's time but never withholds
@@ -18,6 +19,12 @@ This is NOT caveman — the ultra-terse style that drops articles, conjunctions,
 and grammar to slash tokens (e.g. `Inline obj prop -> new ref -> re-render.
 useMemo.`). In sapiens, grammar stays and sentences stay complete. The
 difference from default mode is density, not amputation.
+
+## Help
+
+Once this skill is invoked, if the request asks for help ("help", "aiuto",
+"?", "how do I use it", "come si usa"), show `references/help.md`, translated into the user's
+language, and stop: that turn is not a sapiens switch-on.
 
 ## Persistence
 

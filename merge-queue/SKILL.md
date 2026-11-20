@@ -14,7 +14,9 @@ description: >-
   Ends with a report. Use when the user says "merge queue", "/merge-queue",
   "run the queue", "land / merge my open PRs", "mergia le PR", "fai girare la
   merge queue", "process the ready PRs", or asks to rebase-and-merge a batch
-  of PRs. By default only the PRs of the person running it.
+  of PRs. By default only the PRs of the person running it. "/merge-queue
+  help", "merge-queue help" or "come si usa merge-queue" shows usage with
+  examples.
 ---
 
 # Merge queue (for repos without one)
@@ -29,6 +31,14 @@ is done by `scripts/mq.py` (stdlib Python + an authenticated `gh`). Run it rathe
 than judging gates by eye: the rules below are encoded there and unit-tested.
 `SKILL` below means this skill's directory.
 
+## Help
+
+Once this skill is invoked, if the request asks for help ("help", "aiuto",
+"?", "how do I use it", "come si usa", "esempi"), or the user seems unsure what
+the skill does: show
+`SKILL/references/help.md`, translated into the user's language, and stop.
+Don't run `gh` or the script, and change nothing.
+
 ## 0. Parse the invocation
 
 Defaults come from `SKILL/config/repos.json` (`"*"` → `"owner/*"` → `"owner/repo"`),
@@ -42,6 +52,7 @@ then whatever the user said overrides them. Map their words to flags:
 | "don't update" / "update with rebase" | `--update none\|rebase` | `merge`: GitHub's **Update branch** button with its default, *Update with merge commit* |
 | "merge commit" / "rebase merge" | `--method merge\|rebase` | `squash` (falls back to what the repo allows) |
 | "dry run" / "just check" / "report only" | none: stop after the briefing | off |
+| "help" / "aiuto" / "?" | none: show `references/help.md` and stop | off |
 
 Explicit PR numbers skip the author filter, but nothing else: release PRs and
 PRs that don't target the default branch stay out.
