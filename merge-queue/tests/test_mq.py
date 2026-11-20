@@ -290,7 +290,7 @@ class FieldTest(unittest.TestCase):
     """Regressions from the first live run (AntonioVentilii/neve)."""
 
     def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None,
-                   approved_heads=None, compare=None, open_bases=None):
+                   approved_heads=None, compare=None, open_bases=None, base_commits=("b", "m652")):
         import argparse
         import contextlib
         import io
@@ -307,6 +307,12 @@ class FieldTest(unittest.TestCase):
         def fake_rest(path):
             if "/rules/branches/" in path:
                 return True, rules_payload
+            if "/compare/" in path and path.endswith("...main"):
+                # base history: <since>...main lists the base's commits; <sha>...main
+                # says whether sha is an ancestor of main ("ahead") or not.
+                frm = path.rsplit("/compare/", 1)[1].split("...")[0]
+                return True, {"status": "ahead" if frm in base_commits else "behind",
+                              "commits": [{"sha": c} for c in base_commits]}
             if "/compare/" in path and compare is not None:
                 return True, compare
             return False, "404"
@@ -696,3 +702,68 @@ class SixthRun(unittest.TestCase):
             "strict_required_status_checks_policy": True, "required_status_checks": [{"context": "checks-pass"}]}}]
         text = self.run_status([pr(reviews=conn(review(GREEN)))], fmt="brief", rules_payload=payload)
         self.assertIn("branch must be up to date with `main` before merging", text)
+
+
+class SeventhRun(unittest.TestCase):
+    """Seventh live run (uliveto): 4 of 6 merged; #657 wrongly skipped."""
+
+    run_status = FieldTest.run_status
+
+    def merge_with_main_commits(self):
+        # What compare <approved>...<new head> really returns after someone
+        # merges origin/main: the base's own commits AND the merge commit.
+        main1 = {"sha": "m652", "parents": [{"sha": "m0"}], "commit": {"message": "feat(finanza): … (#652)"}}
+        merge = {"sha": "5ef59a4", "parents": [{"sha": "approved"}, {"sha": "m652"}],
+                 "commit": {"message": "Merge origin/main into av/sicurezza-infrastruttura-meno-rumore"}}
+        return {"status": "ahead", "commits": [main1, merge]}
+
+    def test_base_commits_brought_in_by_a_merge_are_not_new_work(self):
+        in_base = lambda sha: sha in {"m652", "m0"}
+        self.assertEqual(mq.classify_head_change(self.merge_with_main_commits(), "main", in_base=in_base),
+                         {"kind": "merges_only", "count": 1})
+        # a real new commit on top is still caught
+        cmp_ = self.merge_with_main_commits()
+        cmp_["commits"].append({"sha": "own", "parents": [{"sha": "5ef59a4"}], "commit": {"message": "feat: more"}})
+        self.assertEqual(mq.classify_head_change(cmp_, "main", in_base=in_base),
+                         {"kind": "new_commits", "commits": ["feat: more"]})
+
+    def test_end_to_end_merge_of_main_mid_run_goes_ahead(self):
+        import json
+        p = [pr(number=657, headRefOid="5ef59a4", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[657], approved_heads=["657=a0bcdef"],
+                                         compare=self.merge_with_main_commits(), base_commits=("m652", "m0")))
+        r = out["queue"][0]
+        self.assertEqual(r["head_changed"]["kind"], "merges_only")
+        self.assertNotEqual(r["next"], "skip")
+
+    def test_base_membership_uses_one_compare(self):
+        from unittest import mock
+        calls = []
+
+        def fake_rest(path):
+            calls.append(path)
+            if path.endswith("/compare/abc1234...main"):
+                return True, {"commits": [{"sha": "m1"}, {"sha": "m2"}]}
+            return True, {"status": "behind"}  # in_history: not in main
+        with mock.patch.object(mq, "rest", side_effect=fake_rest):
+            in_base = mq.base_membership("o/r", "main", "abc1234")
+            self.assertTrue(in_base("m1") and in_base("m2"))
+            self.assertFalse(in_base("own"))
+            self.assertFalse(in_base("own"))  # cached
+        self.assertEqual(len(calls), 2)
+
+    def test_counts_separate_prs_waiting_for_an_answer(self):
+        blue = pr(number=656, reviews=conn(review(BLUE)),
+                  comments=conn({"url": "u", "author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
+        text = self.run_status([pr(number=652, reviews=conn(review(GREEN))), blue], fmt="brief")
+        self.assertIn("1 can go now, 1 wait for your answer (Copilot), 0 will be skipped", text)
+
+    def test_update_method_always_in_json(self):
+        import json
+        out = json.loads(self.run_status([pr(number=652), pr(number=653, reviews=conn(review(GREEN)))]))
+        self.assertTrue(all("update_method" in r for r in out["queue"]))
+
+    def test_required_check_named_in_why(self):
+        payload = [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "ci"}]}}]
+        text = self.run_status([pr(reviews=conn(review(GREEN)))], fmt="brief", rules_payload=payload)
+        self.assertIn("1 check(s) green (required: ci)", text)

@@ -327,6 +327,25 @@ def fetch_rules(repo: str, base: str) -> dict:
     return rules
 
 
+def base_membership(repo: str, base: str, since: str):
+    """in_base(sha) for one approved head: one compare call lists the base's
+    commits since `since` (the usual case: what a merge of the base brought
+    in); only commits beyond that list cost an extra lookup each."""
+    ok, data = rest(f"repos/{repo}/compare/{since}...{base}")
+    known: set[str] = set()
+    if ok and isinstance(data, dict):
+        known = {c.get("sha") for c in data.get("commits") or [] if c.get("sha")}
+    cache: dict[str, bool] = {}
+
+    def in_base(sha: str) -> bool:
+        if sha in known:
+            return True
+        if sha not in cache:  # older base history, or beyond the listed commits
+            cache[sha] = in_history(repo, base, sha)
+        return cache[sha]
+    return in_base
+
+
 def in_history(repo: str, base: str, sha: str) -> bool:
     """True when commit `sha` is in `base`'s history (i.e. an ancestor of it)."""
     ok, data = rest(f"repos/{repo}/compare/{sha}...{base}")
@@ -489,7 +508,8 @@ def checks_summary(pr: dict, required: list[str] | None = None) -> dict:
         state = "success"
     else:
         state = "none"
-    return {"state": state, "failing": failing, "pending": pending, "passed": len(passed), "sha": commit.get("oid")}
+    return {"state": state, "failing": failing, "pending": pending, "passed": len(passed), "sha": commit.get("oid"),
+            "required": sorted(set(required or []))}
 
 
 def commits_after_review(pr: dict, review_oid: str | None) -> dict | None:
@@ -660,6 +680,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         "number": pr["number"], "title": pr.get("title"), "url": pr.get("url"), "author": author,
         "base": pr.get("baseRefName"), "head": pr.get("headRefName"), "head_sha": pr.get("headRefOid"),
         "excluded": None, "blockers": [], "warnings": [], "gates": {}, "next": None,
+        "update_method": ctx["cfg"].get("update", "merge"),
     }
 
     # ---- filters (exclusion = not part of this queue at all) ----
@@ -803,6 +824,11 @@ def classify_head_change(compare: dict, base: str, in_base=None) -> dict:
     pat = re.compile(MERGE_OF_BASE.format(base=re.escape(base)))
     new, merges = [], 0
     for c in compare.get("commits") or []:
+        # The compare lists every commit reachable from the new head but not
+        # from the approved one, so a merge of the base brings the base's own
+        # commits along: those are already in the base, not new work.
+        if in_base and c.get("sha") and in_base(c["sha"]):
+            continue
         msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0] if c.get("commit") else ""
         parents = [p.get("sha") for p in (c.get("parents") or [])]
         # A merge of the base: a merge commit one of whose other parents is in the
@@ -937,7 +963,7 @@ def cmd_status(a) -> int:
             continue
         ok, cmp_ = rest(f"repos/{repo}/compare/{want}...{r['head_sha']}")
         if ok and isinstance(cmp_, dict):
-            change = classify_head_change(cmp_, base, in_base=lambda sha: in_history(repo, base, sha))
+            change = classify_head_change(cmp_, base, in_base=base_membership(repo, base, want))
         else:
             change = {"kind": "unverified", "error": str(cmp_).strip().splitlines()[0][:160] if cmp_ else "no response"}
         apply_head_change(r, want, change)
@@ -1036,7 +1062,9 @@ def why_text(r: dict) -> str:
         bits.append(f"Copilot {COLOR.get(cp.get('verdict') or '', '')} {cp['detail']}".replace("  ", " "))
     ck = g.get("checks")
     if ck:
-        bits.append({"success": f"{ck['passed']} check(s) green", "none": "no CI",
+        req = ck.get("required") or []
+        green = f"{ck['passed']} check(s) green" + (f" (required: {', '.join(req)})" if req else "")
+        bits.append({"success": green, "none": "no CI",
                      "pending": "CI running", "failure": "CI failing"}.get(ck["state"], ck["state"]))
     behind = (g.get("up_to_date") or {}).get("behind_by")
     if behind:
@@ -1089,8 +1117,10 @@ def print_brief(out: dict) -> None:
     q, ex = out["queue"], out["excluded"]
     goers = [r for r in q if r["next"] in ("merge", "wait_checks", "update", "confirm")]
     print(f"## Merge queue: {out['repo']}\n")
-    print(f"**{len(q) + len(ex)} open PR(s) seen:** {len(goers)} can go now, {len(q) - len(goers)} will be skipped,"
-          f" {len(ex)} out of the queue.\n")
+    waiting = [r for r in goers if r["next"] == "confirm"]
+    print(f"**{len(q) + len(ex)} open PR(s) seen:** {len(goers) - len(waiting)} can go now,"
+          + (f" {len(waiting)} wait for your answer (Copilot)," if waiting else "")
+          + f" {len(q) - len(goers)} will be skipped, {len(ex)} out of the queue.\n")
     print("### Settings")
     print(f"- **Which PRs:** {author}, targeting the default branch `{out['base']}` only. Release PRs are never touched.")
     print("- **Order:** oldest first, one at a time. The next PR starts only after the previous one is merged or skipped.")
