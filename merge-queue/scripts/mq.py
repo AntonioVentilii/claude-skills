@@ -150,7 +150,7 @@ reviews(last: 100) { totalCount nodes { id url author { login __typename } state
 comments(last: 100) { nodes { url author { login __typename } createdAt } }
 reviewThreads(first: 100) { totalCount nodes { isResolved isOutdated comments(first: 30) { nodes { url author { login __typename } createdAt pullRequestReview { id } } } } }
 prCommits: commits(first: 100) { totalCount nodes { commit { oid messageHeadline parents(first: 2) { totalCount nodes { oid } }
-  associatedPullRequests(first: 5) { nodes { number merged } } } } }
+  associatedPullRequests(first: 5) { totalCount nodes { number merged } } } } }
 commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 100) { totalCount nodes {
   __typename
   ... on CheckRun { name status conclusion detailsUrl }
@@ -238,7 +238,7 @@ HISTORY_QUERY = """
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: [MERGED, CLOSED], last: 30, orderBy: {field: UPDATED_AT, direction: ASC}) {
-      nodes { reviews(first: 40) { nodes { author { login } } } }
+      nodes { reviews(last: 100) { totalCount nodes { author { login } } } }
     }
   }
 }
@@ -289,6 +289,8 @@ def repo_uses_copilot(repo: str, open_prs: list[dict]) -> bool:
     for pr in d["repository"]["pullRequests"]["nodes"]:
         if any(is_copilot(r.get("author")) for r in nodes(pr.get("reviews"))):
             return True
+        if truncated(pr.get("reviews")):
+            return True  # can't see every review: assume Copilot is used (fail closed)
     return False
 
 
@@ -606,8 +608,10 @@ def commits_after_review(pr: dict, review_oid: str | None, merge_checker=None) -
     if not oids:
         return None
     idx = next((i for i, c in enumerate(oids) if c.get("oid") == review_oid), None)
+    if truncated(pr.get("prCommits")):
+        return {"truncated": True}  # can't count them: say so rather than under-report
     if idx is None:
-        return None if truncated(pr.get("prCommits")) else {"rewritten": True}
+        return {"rewritten": True}
     after = oids[idx + 1:]
     merges = [c for c in after if ((c.get("parents") or {}).get("totalCount") or 1) > 1]
     out = {"commits": len(after), "merges": len(merges)}
@@ -620,6 +624,8 @@ def commits_after_review(pr: dict, review_oid: str | None, merge_checker=None) -
 def after_review_text(ar: dict | None) -> str:
     if not ar:
         return ""
+    if ar.get("truncated"):
+        return "; more than 100 commits: can't count those since the Copilot review"
     if ar.get("rewritten"):
         return "; the reviewed commit is no longer in the PR (history rewritten since the review)"
     if not ar["commits"]:
@@ -641,9 +647,10 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
 
     `confirm` means: the verdict needs an answer (blue, or yellow without inline
     threads), and there ARE comments after the review, but whether they really
-    resolve it is a human judgement. The result carries the review link and the
-    candidate comment links so the user can be asked. `confirmed=True` (the user
-    said yes for this PR) turns it into ok."""
+    resolve it is a human judgement. The result carries the review link, its
+    `review_id` and the candidate comment links so the user can be asked.
+    `confirmed` is the review_id the user said yes to: it only counts while that
+    is still the latest Copilot review (a newer review needs a new answer)."""
     if mode == "off":
         return {"status": "n/a", "verdict": None, "detail": "Copilot gate disabled"}
     expected = mode == "required" or (mode == "auto" and repo_uses)
@@ -696,7 +703,7 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
 
     label = {"green": "green", "blue": "blue", "yellow": "yellow", "none": "no verdict"}[verdict]
     ar = commits_after_review(pr, (latest.get("commit") or {}).get("oid"), cfg.get("_merge_checker"))
-    base = {"verdict": verdict, "review_url": latest.get("url"), "after_review": ar}
+    base = {"verdict": verdict, "review_url": latest.get("url"), "review_id": latest.get("id"), "after_review": ar}
     if unresolved:
         return {**base, "status": "unhandled",
                 "detail": f"{label}: {len(unresolved)} unresolved Copilot thread(s)" + after_review_text(ar)}
@@ -705,10 +712,11 @@ def eval_copilot(pr: dict, mode: str, repo_uses: bool, cfg: dict, confirmed: boo
         what = "blue (Needs a closer look)" if verdict == "blue" else "yellow (Changes recommended) without inline threads"
         if not candidates:
             return {**base, "status": "unhandled", "detail": f"{what}: nobody has commented since the review" + after_review_text(ar)}
-        if not confirmed:
+        if not confirmed or confirmed != latest.get("id"):
+            stale = " (a newer Copilot review arrived since your confirmation)" if confirmed else ""
             return {**base, "status": "confirm", "candidates": candidates,
                     "detail": f"{what}: {len(candidates)} comment(s) since the review; ask the user whether it is resolved"
-                              + after_review_text(ar)}
+                              + stale + after_review_text(ar)}
         return {**base, "status": "ok", "detail": f"{label}, confirmed resolved by the user" + after_review_text(ar)}
     return {**base, "status": "ok", "detail": f"{label}, handled" + after_review_text(ar)}
 
@@ -721,22 +729,26 @@ def rebase_risk(pr: dict) -> dict | None:
     Merge commits in the PR are another usual cause."""
     merged: set[int] = set()
     merge_commits = 0
+    unknown = truncated(pr.get("prCommits"))
     for n in nodes(pr.get("prCommits")):
         c = n.get("commit") or {}
         if ((c.get("parents") or {}).get("totalCount") or 1) > 1:
             merge_commits += 1
+        unknown |= truncated(c.get("associatedPullRequests"))
         for ap in nodes(c.get("associatedPullRequests")):
             if ap.get("merged") and ap.get("number") != pr.get("number"):
                 merged.add(ap["number"])
-    if not merged and not merge_commits:
+    if not merged and not merge_commits and not unknown:
         return None
     bits = []
+    if unknown:
+        bits.append("too many commits (or PRs per commit) to check them all: a conflict can't be ruled out")
     if merged:
         bits.append("carries the original commits of " + ", ".join(f"#{n}" for n in sorted(merged))
                     + ", already merged into the base as different commits")
     if merge_commits:
         bits.append(f"contains {merge_commits} merge commit(s)")
-    return {"merged_prs": sorted(merged), "merge_commits": merge_commits, "reason": "; ".join(bits)}
+    return {"merged_prs": sorted(merged), "merge_commits": merge_commits, "unknown": unknown, "reason": "; ".join(bits)}
 
 
 def eval_approvals(pr: dict, rules: dict) -> dict:
@@ -826,7 +838,7 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
 
     # ---- 2. Copilot review ----
     cp = eval_copilot(pr, cfg.get("copilot", "auto"), ctx["repo_uses_copilot"], cfg,
-                      confirmed=pr["number"] in ctx.get("confirmed", set()))
+                      confirmed=ctx.get("confirmed", {}).get(pr["number"]))
     if cp["status"] == "missing" and rules.get("copilot_review") and "opened against" not in cp["detail"]:
         cp["detail"] = cp["detail"].replace(
             "(repo normally gets one)",
@@ -892,6 +904,12 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
         res["next"] = "confirm"
         return res
 
+    if pr["number"] in ctx.get("behind", {}) and behind is None:
+        # The compare failed: we don't know whether it is up to date. Don't
+        # update or merge on a guess.
+        res["blockers"].append(f"can't tell whether it is up to date with `{ctx['base']}` (compare failed) - re-run")
+        res["next"] = "skip"
+        return res
     needs_update = cfg.get("update") != "none" and (behind is None or behind > 0 or pr.get("mergeStateStatus") == "BEHIND")
     upd = cfg.get("update", "merge")
     risk = rebase_risk(pr) if upd == "rebase" else None
@@ -1048,8 +1066,29 @@ def parse_heads(items) -> dict[int, str]:
     return out
 
 
+def parse_confirmed(items) -> dict[int, str]:
+    """`N=REVIEW_ID` pairs: the Copilot review the user confirmed for PR N
+    (review_id from the status JSON), so a later review isn't confirmed by it."""
+    out: dict[int, str] = {}
+    for it in items or []:
+        for tok in re.split(r"[\s,]+", str(it).strip()):
+            if not tok:
+                continue
+            n, eq, rid = tok.partition("=")
+            n = n.strip().lstrip("#")
+            if not eq or not n.isdigit() or not rid.strip():
+                raise UsageError(f"--confirmed: bad entry {tok!r}, expected N=REVIEW_ID (review_id from the status"
+                                 " JSON), so a newer Copilot review isn't confirmed by mistake")
+            out[int(n)] = rid.strip()
+    return out
+
+
 def cmd_status(a) -> int:
-    approved = parse_heads(getattr(a, "approved_heads", None))  # validate before any network call
+    # Validate everything before any network call.
+    if getattr(a, "approved_heads", None) == []:
+        raise UsageError("--approved-heads given without values: pass N=SHA for every approved PR, or omit it")
+    approved = parse_heads(getattr(a, "approved_heads", None))
+    confirmed = parse_confirmed(getattr(a, "confirmed", None))
     repo = a.repo or current_repo()
     cfg = apply_cli_overrides(load_config(repo), a)
     # Local clone of this repo: lets the script redo merges of the base to
@@ -1069,7 +1108,7 @@ def cmd_status(a) -> int:
     uses = cfg.get("copilot") == "auto" and (bool(rules.get("copilot_review")) or repo_uses_copilot(repo, prs))
     method, method_note = choose_method(meta, rules, cfg.get("method", "squash"))
     ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses, "merge_method": method,
-           "explicit": bool(a.pr), "behind": {}, "confirmed": set(a.confirmed or [])}
+           "explicit": bool(a.pr), "behind": {}, "confirmed": confirmed}
 
     # First pass without behind info, then compute behind only for PRs still in play.
     prelim = [evaluate_pr(pr, ctx) for pr in prs]
@@ -1090,6 +1129,9 @@ def cmd_status(a) -> int:
         if not want:
             if approved:
                 unchecked.append(r["number"])
+                if r["next"] in ("update", "merge", "wait_checks", "confirm"):
+                    r["blockers"].append("no approved head given for it: can't check it against the briefing")
+                    r["next"] = "skip"
             continue
         if (r["head_sha"] or "").lower().startswith(want):
             continue
@@ -1125,6 +1167,9 @@ def cmd_status(a) -> int:
     # PRs in the queue touching the same files: the later one may conflict
     # once the earlier lands (it is then skipped). Said up front.
     files_of = {pr["number"]: {f.get("path") for f in nodes(pr.get("files"))} for pr in prs}
+    for r, pr in zip(results, prs):
+        if r["next"] != "excluded" and truncated(pr.get("files")):
+            r["warnings"].append("more than 100 files changed: the shared-files check only saw the first 100")
     goers = [r for r in results if r["next"] in ("update", "merge", "wait_checks", "confirm")]
     for i, r in enumerate(goers):
         shared = {}
@@ -1135,8 +1180,16 @@ def cmd_status(a) -> int:
         if shared:
             r["overlaps"] = shared
 
+    if not method:
+        for r in results:
+            if r["next"] in ("update", "merge", "wait_checks", "confirm"):
+                r["blockers"].append("no merge method is allowed by the repo settings and branch rules")
+                r["next"] = "skip"
+
     perm = meta.get("viewerPermission")
     notes = []
+    if not method:
+        notes.append(f"no merge method available ({method_note}): nothing can be merged")
     if not cfg.get("_merge_checker"):
         notes.append(f"not run inside a clone of {repo}: merges of the base can't be checked for conflicts"
                      " resolved by hand")
@@ -1395,6 +1448,7 @@ def cmd_wait_checks(a) -> int:
     repo = a.repo or current_repo()
     deadline = time.time() + a.timeout_sec
     first_seen_new_head = None
+    seen_head = None
     last = None
     first = fetch_one(repo, a.pr[0])
     required = fetch_rules(repo, first.get("baseRefName") or "main").get("required_checks")
@@ -1405,7 +1459,8 @@ def cmd_wait_checks(a) -> int:
             # Server-side update not visible yet.
             last = {"result": "pending", "reason": "waiting for the updated head commit", "head": sha}
         else:
-            first_seen_new_head = first_seen_new_head or time.time()
+            if sha != seen_head:  # a new head: its checks may still be registering
+                seen_head, first_seen_new_head = sha, time.time()
             ck = checks_summary(pr, required)
             last = {"result": ck["state"], "head": sha, "failing": ck["failing"], "pending": ck["pending"], "passed": ck["passed"]}
             if ck["state"] == "failure":
@@ -1461,7 +1516,8 @@ def main(argv=None) -> int:
     s.add_argument("--copilot", choices=["auto", "required", "off"])
     s.add_argument("--update", choices=["rebase", "merge", "none"])
     s.add_argument("--method", choices=["squash", "merge", "rebase"])
-    s.add_argument("--confirmed", type=int, nargs="*", help="PRs whose blue/yellow Copilot review the user confirmed as resolved")
+    s.add_argument("--confirmed", nargs="*", metavar="N=REVIEW_ID",
+                   help="Copilot reviews the user confirmed as resolved: PR number = review_id from the status JSON")
     s.add_argument("--approved-heads", nargs="*", metavar="N=SHA",
                    help="head SHA of each PR as shown in the approved briefing; a PR whose head got new commits since is skipped")
     s.add_argument("--format", choices=["json", "table", "brief"], default="json")

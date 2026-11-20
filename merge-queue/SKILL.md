@@ -93,8 +93,11 @@ comments after them come out as `next: confirm`. The skill never assumes those
 comments resolve the review. The briefing lists the review link and the links of
 the comments posted after it, under "Need your answer". Ask the user which
 ones are resolved in the same message as the go-ahead. Re-run `status` with
-`--confirmed 14 17` for the PRs they confirm. The PRs they don't confirm are
-skipped as "Copilot review not confirmed resolved".
+`--confirmed 14=<review_id> 17=<review_id>` for the PRs they confirm, taking
+each `review_id` from the JSON (`gates.copilot.review_id`). A confirmation only
+covers that review: if a newer Copilot review lands during the run, the PR asks
+again. The PRs they don't confirm are skipped as "Copilot review not confirmed
+resolved".
 
 Also read `notes`. If the viewer has no write permission, stop after the
 briefing. If the branch has a native merge queue, say so (the user may prefer
@@ -114,7 +117,8 @@ written out (`--approved-heads 102=64ad16b 103=8298b6d`), or as one quoted
 string (`--approved-heads "$HEADS"`). Never pass an unquoted `$HEADS`: zsh,
 the default shell on macOS, doesn't split it. The script now rejects anything
 malformed, and lists under `notes` any approved PR it had no head for: if
-that note appears, the check didn't run for that PR, so fix the command. If someone else pushes to a PR during the run:
+that note appears, the check didn't run for that PR (and the PR is skipped),
+so fix the command. If someone else pushes to a PR during the run:
 - if the push is only a merge of the base (someone pressed Update branch, or
   merged `origin/main` locally), the run continues, with a warning that goes
   in the report. A merge counts as "of the base" when one of its parents is in
@@ -225,7 +229,7 @@ gh pr update-branch N                   # add --rebase only when update_method i
 python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
 #    (no --not-sha when there was no update)
 # c. re-verify everything on the final head
-python3 SKILL/scripts/mq.py status --pr N [--confirmed N] --approved-heads N=<approved sha>
+python3 SKILL/scripts/mq.py status --pr N [--confirmed N=<review_id>] --approved-heads N=<approved sha>
 # d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase).
 #    Direct merge by default; add --auto only when merge_mode is "auto".
 gh pr merge N --<merge_method> --match-head-commit <head_sha>

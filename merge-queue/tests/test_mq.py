@@ -87,7 +87,8 @@ class CopilotGate(unittest.TestCase):
         self.assertEqual(r["status"], "confirm")
         self.assertEqual(r["review_url"], "https://x/r1")
         self.assertEqual([x["url"] for x in r["candidates"]], ["https://x/c1"])
-        self.assertEqual(self.ev(p, confirmed=True)["status"], "ok")
+        self.assertEqual(r["review_id"], "R1")
+        self.assertEqual(self.ev(p, confirmed="R1")["status"], "ok")
 
     def test_blue_answer_before_review_does_not_count(self):
         p = pr(reviews=conn(review(BLUE)), comments=conn({"author": ME, "createdAt": "2026-11-01T09:00:00Z"}))
@@ -198,7 +199,7 @@ class Evaluate(unittest.TestCase):
     def test_blue_confirm_flow(self):
         p = pr(reviews=conn(review(BLUE)), comments=conn({"author": ME, "createdAt": "2026-11-01T11:00:00Z"}))
         self.assertEqual(mq.evaluate_pr(p, ctx())["next"], "confirm")
-        self.assertEqual(mq.evaluate_pr(p, ctx(confirmed={1}))["next"], "merge")
+        self.assertEqual(mq.evaluate_pr(p, ctx(confirmed={1: "R1"}))["next"], "merge")
         # other blockers win: no point asking about a PR that is skipped anyway
         self.assertEqual(mq.evaluate_pr({**p, "isDraft": True}, ctx())["next"], "skip")
 
@@ -964,3 +965,111 @@ class TenthRun(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.assertEqual(mq.main(["changes", "--repo", "o/r", "--heads"]), 3)
+
+
+
+class SecondCopilotReview(unittest.TestCase):
+    """Copilot's second review of PR #1: nine fail-closed gaps."""
+
+    run_status = FieldTest.run_status
+
+    def blue_pr(self, reviews):
+        return pr(number=656, reviews=conn(*reviews),
+                  comments=conn({"url": "u", "author": ME, "createdAt": "2026-11-03T11:00:00Z"}))
+
+    def test_confirmation_is_bound_to_the_review(self):
+        old = review(BLUE, at="2026-11-01T10:00:00Z", rid="R1")
+        new = review(BLUE, at="2026-11-02T10:00:00Z", rid="R2")
+        # confirmed R1, but R2 is now the latest: ask again
+        cp = mq.eval_copilot(self.blue_pr([old, new]), "auto", True, mq.DEFAULTS, confirmed="R1")
+        self.assertEqual(cp["status"], "confirm")
+        self.assertIn("newer Copilot review arrived", cp["detail"])
+        self.assertEqual(mq.eval_copilot(self.blue_pr([old, new]), "auto", True, mq.DEFAULTS, confirmed="R2")["status"], "ok")
+
+    def test_confirmed_needs_review_ids(self):
+        self.assertEqual(mq.parse_confirmed(["656=PRR_abc 14=PRR_def"]), {656: "PRR_abc", 14: "PRR_def"})
+        with self.assertRaises(mq.UsageError):
+            mq.parse_confirmed(["656"])
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.main(["status", "--repo", "o/r", "--confirmed", "656"]), 3)
+            self.assertEqual(mq.main(["status", "--repo", "o/r", "--approved-heads"]), 3)
+        self.assertIn("without values", buf.getvalue())
+
+    def test_failed_compare_is_not_an_update(self):
+        c = ctx(behind={1: None})
+        r = mq.evaluate_pr(pr(reviews=conn(review(GREEN))), c)
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("can't tell whether it is up to date", " ".join(r["blockers"]))
+        c["cfg"]["update"] = "none"
+        self.assertEqual(mq.evaluate_pr(pr(reviews=conn(review(GREEN))), c)["next"], "skip")
+
+    def test_missing_approved_head_skips_the_pr(self):
+        import json
+        p = [pr(number=651, headRefOid="0505fb8aa", reviews=conn(review(GREEN))),
+             pr(number=655, headRefOid="8298b6daa", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[651, 655], approved_heads=["651=0505fb8"]))
+        q = {r["number"]: r for r in out["queue"]}
+        self.assertEqual(q[655]["next"], "skip")
+        self.assertIn("no approved head given", " ".join(q[655]["blockers"]))
+        self.assertNotEqual(q[651]["next"], "skip")
+
+    def test_settle_window_restarts_on_a_new_head(self):
+        """H1 is seen green; 100s later a push makes H2, also green on its
+        first poll. The old code reused H1's timer (100s > 30s settle) and took
+        H2 at once; H2 must first settle on its own."""
+        import argparse, contextlib, io, json
+        from unittest import mock
+        now = {"t": 1000}  # not 0: a timer at t=0 is falsy and would hide the bug
+        polls = []
+
+        def fake_fetch(repo, n):
+            h = "H1" if now["t"] < 1100 else "H2"
+            polls.append((now["t"], h))
+            return pr(headRefOid=h)
+
+        def fake_sleep(_):
+            now["t"] += 100 if now["t"] < 1100 else 10
+
+        a = argparse.Namespace(repo="o/r", pr=[1], not_sha=None, timeout_sec=1000, settle_sec=90, interval=0)
+        buf = io.StringIO()
+        with mock.patch.object(mq, "fetch_one", side_effect=fake_fetch), \
+                mock.patch.object(mq, "fetch_rules", return_value={"required_checks": []}), \
+                mock.patch.object(mq.time, "time", side_effect=lambda: now["t"]), \
+                mock.patch.object(mq.time, "sleep", side_effect=fake_sleep), contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.cmd_wait_checks(a), 0)
+        self.assertEqual(json.loads(buf.getvalue())["head"], "H2")
+        first_h2 = min(t for t, h in polls if h == "H2")
+        accepted_at = polls[-1][0]
+        self.assertGreaterEqual(accepted_at - first_h2, 30)  # H2 settled on its own timer
+
+    def test_truncated_files_and_commits_fail_closed(self):
+        import json
+        many = {"totalCount": 150, "nodes": [{"path": "a"}]}
+        out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)), files=many)]))
+        self.assertIn("shared-files check only saw the first 100", " ".join(out["queue"][0]["warnings"]))
+        big = {"totalCount": 150, "nodes": [{"commit": {"oid": "c1", "parents": {"totalCount": 1},
+                                                        "associatedPullRequests": {"totalCount": 0, "nodes": []}}}]}
+        self.assertTrue(mq.rebase_risk(pr(prCommits=big))["unknown"])
+        self.assertEqual(mq.commits_after_review(pr(prCommits=big), "c1"), {"truncated": True})
+        lots = {"totalCount": 1, "nodes": [{"commit": {"oid": "c1", "parents": {"totalCount": 1},
+                                                       "associatedPullRequests": {"totalCount": 9, "nodes": []}}}]}
+        self.assertTrue(mq.rebase_risk(pr(prCommits=lots))["unknown"])
+
+    def test_no_merge_method_nothing_actionable(self):
+        import json
+        meta = {"squashMergeAllowed": False, "mergeCommitAllowed": False, "rebaseMergeAllowed": False}
+        out = json.loads(self.run_status([pr(reviews=conn(review(GREEN)))], meta_extra=meta))
+        self.assertEqual(out["queue"][0]["next"], "skip")
+        self.assertIn("no merge method", " ".join(out["notes"]))
+
+    def test_copilot_history_truncated_fails_closed(self):
+        from unittest import mock
+        hist = {"repository": {"pullRequests": {"nodes": [
+            {"reviews": {"totalCount": 150, "nodes": [{"author": {"login": "bob"}}]}}]}}}
+        with mock.patch.object(mq, "graphql", return_value=hist):
+            self.assertTrue(mq.repo_uses_copilot("o/r", []))
+        hist["repository"]["pullRequests"]["nodes"][0]["reviews"]["totalCount"] = 1
+        with mock.patch.object(mq, "graphql", return_value=hist):
+            self.assertFalse(mq.repo_uses_copilot("o/r", []))
