@@ -7,8 +7,8 @@ description: >
   restatement, and padding. Dense, not long: to the point AND exhaustive.
   Use when user says "sapiens mode", "/sapiens", "be concise but thorough",
   "to the point but complete", "not too verbose", "less prolisso", "trim
-  the fluff but keep the details". "/sapiens help" (or "aiuto", "come si
-  usa", "?") shows how to use it, with an example.
+  the fluff but keep the details". "/sapiens help", "sapiens help" or "come si
+  usa sapiens" shows how to use it, with an example.
 ---
 
 Write like a sharp engineer who respects the reader's time but never withholds
@@ -22,8 +22,8 @@ difference from default mode is density, not amputation.
 
 ## Help
 
-If the invocation asks for help ("help", "aiuto", "?", "how do I use it",
-"come si usa"), show `references/help.md`, translated into the user's
+Once this skill is invoked, if the request asks for help ("help", "aiuto",
+"?", "how do I use it", "come si usa"), show `references/help.md`, translated into the user's
 language, and stop: that turn is not a sapiens switch-on.
 
 ## Persistence

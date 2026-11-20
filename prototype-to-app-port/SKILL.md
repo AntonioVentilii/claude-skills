@@ -14,8 +14,8 @@ description: >-
   ask only on real decisions), a durable living tracker, per-project guardrails,
   and the field-QA fidelity loop. Reach for this even when the user only says
   "make our app match the new design" without naming a process.
-  "/prototype-to-app-port help" (or "aiuto", "come si usa", "?") shows usage
-  with examples.
+  "/prototype-to-app-port help", "prototype-to-app-port help" or "come si usa
+  prototype-to-app-port" shows usage with examples.
 ---
 
 # Prototype → App Port
@@ -33,8 +33,8 @@ the start of a port and treat as binding.
 
 ## Help
 
-If the invocation asks for help ("help", "aiuto", "?", "how do I use it",
-"come si usa", "esempi"), show `references/help.md`, translated into the
+Once this skill is invoked, if the request asks for help ("help", "aiuto",
+"?", "how do I use it", "come si usa", "esempi"), show `references/help.md`, translated into the
 user's language, and stop. Don't start a port.
 
 ## How to use this skill

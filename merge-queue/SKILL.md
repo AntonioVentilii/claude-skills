@@ -15,7 +15,8 @@ description: >-
   "run the queue", "land / merge my open PRs", "mergia le PR", "fai girare la
   merge queue", "process the ready PRs", or asks to rebase-and-merge a batch
   of PRs. By default only the PRs of the person running it. "/merge-queue
-  help" (or "aiuto", "come si usa", "?") shows usage with examples.
+  help", "merge-queue help" or "come si usa merge-queue" shows usage with
+  examples.
 ---
 
 # Merge queue (for repos without one)
@@ -32,8 +33,9 @@ than judging gates by eye: the rules below are encoded there and unit-tested.
 
 ## Help
 
-If the invocation asks for help ("help", "aiuto", "?", "how do I use it",
-"come si usa", "esempi"), or the user seems unsure what the skill does: show
+Once this skill is invoked, if the request asks for help ("help", "aiuto",
+"?", "how do I use it", "come si usa", "esempi"), or the user seems unsure what
+the skill does: show
 `SKILL/references/help.md`, translated into the user's language, and stop.
 Don't run `gh` or the script, and change nothing.
 

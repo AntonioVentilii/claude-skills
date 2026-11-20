@@ -1,9 +1,10 @@
 # merge-queue: how to use it
 
 A merge queue for repos without GitHub's: it takes your open PRs into the
-default branch, oldest first, **one at a time**. For each one it checks the
-PR can go, brings it up to date with the default branch, waits for CI, then
-merges it. It always shows a briefing first and waits for your go-ahead.
+repo's default branch (`main`, `master`, …), oldest first, **one at a time**.
+For each one it checks the PR can go, brings it up to date with the default
+branch, waits for CI, then merges it. It always shows a briefing first, then
+waits for your go-ahead (unless you said "go, don't ask").
 
 Run it **inside the repo's folder** (its clone), in a Claude Code chat.
 
@@ -11,7 +12,7 @@ Run it **inside the repo's folder** (its clone), in a Claude Code chat.
 
 | You type | What happens |
 |---|---|
-| `/merge-queue` | Your open PRs into `main`, oldest first. Briefing first, then it waits for your go-ahead. |
+| `/merge-queue` | Your open PRs into the default branch, oldest first. Briefing first, then it waits for your go-ahead. |
 | `/merge-queue dry run` | Briefing only: what it would do and why. Nothing is changed. |
 | `/merge-queue #12 #15` | Only those PRs, in that order. |
 | `/merge-queue all` | Everyone's PRs, not only yours. |
@@ -33,7 +34,8 @@ mie PR", "run the queue on #12 and #15, dry run".
 2. Its Copilot review has arrived and is handled (when the repo uses Copilot):
    - 🟢 green: every Copilot thread resolved;
    - 🔵 blue: threads resolved, and **you** confirm the comments after it resolve it (it asks, with links);
-   - 🟡 yellow: every Copilot thread resolved.
+   - 🟡 yellow: every Copilot thread resolved. If it has no inline threads, it
+     works like blue: it asks you to confirm.
 
    The skill never requests a Copilot review for you.
 3. The approvals the branch rules require; no open "changes requested".
