@@ -906,3 +906,61 @@ class NinthRun(unittest.TestCase):
         r = out["queue"][0]
         self.assertEqual(r["next"], "skip")
         self.assertEqual(r["gates"]["up_to_date"]["behind_by"], 0)
+
+
+class TenthRun(unittest.TestCase):
+    """Tenth live run (third repo): 7 of 7 merged; three small findings."""
+
+    run_status = FieldTest.run_status
+
+    def reviewed_then_fixed(self, n=598):
+        rv = {**review(YELLOW), "commit": {"oid": "c1"}}
+        commits = {"totalCount": 2, "nodes": [
+            {"commit": {"oid": "c1", "parents": {"totalCount": 1, "nodes": [{"oid": "c0"}]}}},
+            {"commit": {"oid": "c2", "parents": {"totalCount": 1, "nodes": [{"oid": "c1"}]}}}]}
+        return pr(number=n, reviews=conn(rv), reviewThreads=conn(thread(True)), prCommits=commits)
+
+    def test_commits_since_review_are_a_warning_said_once(self):
+        r = mq.evaluate_pr(self.reviewed_then_fixed(), ctx(behind={598: 0}))
+        self.assertIn("1 new commit(s) since the Copilot review", " ".join(r["warnings"]))
+        self.assertEqual(mq.why_text(r).count("since the Copilot review"), 1)
+
+    def test_missing_copilot_despite_the_rule(self):
+        c = ctx(rules={"required_approvals": 0, "copilot_review": {"review_on_push": False, "review_drafts": False}})
+        r = mq.evaluate_pr(pr(number=600), c)
+        self.assertIn("a branch rule should have requested it, but it never started on this PR", " ".join(r["blockers"]))
+        # without the rule the old wording stays
+        r = mq.evaluate_pr(pr(number=600), ctx())
+        self.assertIn("(repo normally gets one)", " ".join(r["blockers"]))
+
+    def test_all_heads_cover_queued_and_excluded(self):
+        import json
+        p = [pr(number=598, headRefOid="aaaaaaa1", reviews=conn(review(GREEN))),
+             pr(number=610, headRefOid="bbbbbbb2", title="chore(release): v1.57.0")]
+        out = json.loads(self.run_status(p))
+        self.assertEqual(out["all_heads"], {"598": "aaaaaaa1", "610": "bbbbbbb2"})
+
+    def test_diff_heads(self):
+        before = {598: "aaaaaaa", 599: "1111111", 600: "2222222"}
+        now = [{"number": 599, "title": "x", "headRefOid": "f3e972c999"},
+               {"number": 600, "title": "y", "headRefOid": "2222222abc"},
+               {"number": 610, "title": "chore(release): v1.57.0", "headRefOid": "r", "author": {"login": "av-automation"},
+                "baseRefName": "main"}]
+        d = mq.diff_heads(before, now)
+        self.assertEqual(d["changed"], [{"number": 599, "title": "x", "was": "1111111", "now": "f3e972c"}])
+        self.assertEqual([a["number"] for a in d["appeared"]], [610])
+        self.assertEqual(d["closed_or_merged"], [598])
+
+    def test_changes_command(self):
+        import contextlib, io, json
+        from unittest import mock
+        buf = io.StringIO()
+        with mock.patch.object(mq, "open_prs", return_value=[{"number": 599, "headRefOid": "f3e972c"}]), \
+                contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.main(["changes", "--repo", "o/r", "--heads", "598=aaaaaaa 599=1111111"]), 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["closed_or_merged"], [598])
+        self.assertEqual(out["changed"][0]["number"], 599)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.main(["changes", "--repo", "o/r", "--heads"]), 3)

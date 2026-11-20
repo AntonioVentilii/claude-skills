@@ -127,6 +127,12 @@ that note appears, the check didn't run for that PR, so fix the command. If some
 After **your own** update in step a, replace that PR's entry with the new head
 that `wait-checks` reports, so your own merge commit isn't flagged.
 
+Also keep the briefing's `all_heads` (every PR it saw, queued or not) as it
+was at the go-ahead, and don't update it. At the end of the run,
+`mq.py changes --heads <all_heads>` lists every open PR whose head moved, every
+PR that appeared, and every PR that was closed or merged, PRs outside the
+queue included. That is the source for the report's "changed during the run".
+
 **Stacked PRs.** When a queued PR is the base of other open PRs, the briefing
 lists them under "Stacked PRs": merging it makes GitHub retarget them to the
 default branch (when the branch is deleted on merge), still carrying the
@@ -345,9 +351,13 @@ confirmation · 🚫 excluded.
   same rebase conflict), state it once below the table with the fix, and keep
   their rows short ("see below").
 - **Changed during the run.** After the table, list anything that changed
-  around the queue: stacked PRs retargeted, PRs that appeared, conflicts that
-  appeared ("not processed"), and any head that someone else pushed to during
-  the run, with what they pushed and whether the PR went ahead or was skipped.
+  around the queue, from `mq.py changes --heads <all_heads>`:
+  - stacked PRs retargeted;
+  - PRs that appeared, or were closed or merged;
+  - conflicts that appeared ("not processed");
+  - any head that someone else pushed to during the run, queued or not: what
+    they pushed, and for queued PRs whether the PR went ahead or was skipped.
+    Your own updates are not part of this list.
   When that happens, say plainly that someone (another session, an automation)
   is working on the queue's PRs in parallel, and suggest pausing it while the
   queue runs: each of their merges chases a base that is still moving.

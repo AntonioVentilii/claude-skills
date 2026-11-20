@@ -8,6 +8,8 @@ Subcommands
                 and print the ordered queue with the next action for each PR.
   wait-checks   Block until the PR's head commit has a terminal CI result.
   wait-merged   Block until the PR is merged (after arming auto-merge).
+  changes       What changed among ALL open PRs since the briefing (heads
+                moved, PRs that appeared, PRs closed or merged).
 
 Exit codes
   status:       0 always (unless gh/repo errors -> 3)
@@ -188,23 +190,48 @@ query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 100, after: $cursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { number baseRefName }
+      nodes { number title baseRefName headRefOid author { login } }
     }
   }
 }
 """
 
 
-def open_pr_bases(repo: str) -> list[tuple[int, str]]:
+def open_prs(repo: str) -> list[dict]:
     owner, name = repo.split("/", 1)
     out, cursor = [], None
     while True:
         d = graphql(OPEN_BASES_QUERY, owner=owner, name=name, cursor=cursor)
         conn_ = d["repository"]["pullRequests"]
-        out += [(n["number"], n["baseRefName"]) for n in conn_["nodes"]]
+        out += conn_["nodes"]
         if not conn_["pageInfo"]["hasNextPage"]:
             return out
         cursor = conn_["pageInfo"]["endCursor"]
+
+
+def open_pr_bases(repo: str) -> list[tuple[int, str]]:
+    return [(n["number"], n["baseRefName"]) for n in open_prs(repo)]
+
+
+def diff_heads(before: dict[int, str], now: list[dict]) -> dict:
+    """What changed among open PRs since the briefing: `before` = number→head
+    from the briefing (all PRs it saw, queued or not); `now` = open PRs."""
+    cur = {n["number"]: n for n in now}
+    changed = [{"number": k, "title": cur[k].get("title"), "was": v[:7], "now": (cur[k].get("headRefOid") or "")[:7]}
+               for k, v in sorted(before.items()) if k in cur and not (cur[k].get("headRefOid") or "").startswith(v)]
+    appeared = [{"number": k, "title": n.get("title"), "author": (n.get("author") or {}).get("login"),
+                 "base": n.get("baseRefName")} for k, n in sorted(cur.items()) if k not in before]
+    gone = sorted(k for k in before if k not in cur)
+    return {"changed": changed, "appeared": appeared, "closed_or_merged": gone}
+
+
+def cmd_changes(a) -> int:
+    before = parse_heads(a.heads)
+    if not before:
+        raise UsageError("changes: pass --heads N=SHA for every PR in the briefing (its all_heads)")
+    repo = a.repo or current_repo()
+    print(json.dumps(diff_heads(before, open_prs(repo)), indent=2))
+    return 0
 
 
 HISTORY_QUERY = """
@@ -800,10 +827,19 @@ def evaluate_pr(pr: dict, ctx: dict) -> dict:
     # ---- 2. Copilot review ----
     cp = eval_copilot(pr, cfg.get("copilot", "auto"), ctx["repo_uses_copilot"], cfg,
                       confirmed=pr["number"] in ctx.get("confirmed", set()))
+    if cp["status"] == "missing" and rules.get("copilot_review") and "opened against" not in cp["detail"]:
+        cp["detail"] = cp["detail"].replace(
+            "(repo normally gets one)",
+            "(a branch rule should have requested it, but it never started on this PR: e.g. it was opened as a"
+            " draft, or before the rule existed)")
     res["gates"]["copilot"] = cp
     if cp["status"] in ("pending", "missing", "unhandled"):
         res["blockers"].append("Copilot: " + cp["detail"])
-    hand = ((cp.get("after_review") or {}).get("hand_merges")) or 0
+    ar = cp.get("after_review") or {}
+    own = (ar.get("commits") or 0) - (ar.get("merges") or 0)
+    if own > 0:
+        res["warnings"].append(f"{own} new commit(s) since the Copilot review: code Copilot hasn't seen")
+    hand = ar.get("hand_merges") or 0
     if hand:
         res["warnings"].append(f"{hand} merge(s) of the base with conflicts resolved by hand since the Copilot review:"
                                " code Copilot hasn't seen")
@@ -1126,6 +1162,8 @@ def cmd_status(a) -> int:
         "rules": rules, "notes": notes,
         "queue": [r for r in results if r["next"] != "excluded"],
         "excluded": [{"number": r["number"], "title": r["title"], "author": r["author"], "reason": r["excluded"]} for r in results if r["next"] == "excluded"],
+        # every PR this status saw, queued or not: feed it to `changes --heads` at the end of the run
+        "all_heads": {str(r["number"]): (r["head_sha"] or "")[:12] for r in results if r.get("head_sha")},
     }
     if a.format == "table":
         print_table(out)
@@ -1183,8 +1221,8 @@ def why_text(r: dict) -> str:
     if behind:
         bits.append(f"behind by {behind} right now")
     shown = " ".join(bits)
-    bits += r.get("blockers", []) + [w for w in r.get("warnings", [])
-                                     if not ("resolved by hand" in w and "resolved by hand" in shown)]
+    said = lambda w: any(k in w and k in shown for k in ("resolved by hand", "since the Copilot review"))
+    bits += r.get("blockers", []) + [w for w in r.get("warnings", []) if not said(w)]
     return "; ".join(bits) or "all gates pass"
 
 
@@ -1437,6 +1475,12 @@ def main(argv=None) -> int:
     w.add_argument("--settle-sec", type=int, default=90)
     w.add_argument("--interval", type=int, default=20)
     w.set_defaults(fn=cmd_wait_checks)
+
+    c = sub.add_parser("changes", help="what changed among open PRs since the briefing")
+    c.add_argument("--repo")
+    c.add_argument("--heads", nargs="*", metavar="N=SHA", required=True,
+                   help="all_heads from the briefing's JSON: every PR it saw, queued or not")
+    c.set_defaults(fn=cmd_changes)
 
     m = sub.add_parser("wait-merged")
     m.add_argument("--repo")
