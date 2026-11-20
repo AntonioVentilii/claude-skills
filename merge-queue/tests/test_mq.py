@@ -290,7 +290,7 @@ class FieldTest(unittest.TestCase):
     """Regressions from the first live run (AntonioVentilii/neve)."""
 
     def run_status(self, prs, fmt="json", rules_payload=None, meta_extra=None, cfg_extra=None, pr_args=None,
-                   approved_heads=None, compare=None):
+                   approved_heads=None, compare=None, open_bases=None):
         import argparse
         import contextlib
         import io
@@ -315,7 +315,9 @@ class FieldTest(unittest.TestCase):
         a = argparse.Namespace(repo="o/r", pr=pr_args, author=None, copilot=None, update=None, method=None,
                                confirmed=None, format=fmt, approved_heads=approved_heads)
         buf = io.StringIO()
+        bases = open_bases if open_bases is not None else [(p_["number"], p_.get("baseRefName")) for p_ in prs]
         with mock.patch.object(mq, "fetch_repo", return_value=(meta, prs, "antonio")), \
+                mock.patch.object(mq, "open_pr_bases", return_value=bases), \
                 mock.patch.object(mq, "rest", side_effect=fake_rest), \
                 mock.patch.object(mq, "repo_uses_copilot", return_value=True), \
                 mock.patch.object(mq, "behind_by", return_value=0), \
@@ -367,7 +369,7 @@ class FieldTest(unittest.TestCase):
     def test_code_owner_rule_explained_in_approvals(self):
         r = mq.eval_approvals(pr(), {"code_owner_review": True})
         self.assertTrue(r["ok"])
-        self.assertIn("code-owner rule exists but doesn't apply", r["detail"])
+        self.assertIn("code-owner rule exists but GitHub doesn't apply it here: no CODEOWNERS file", r["detail"])
 
 
 def carried(*merged_pr_numbers, merge_commit=False):
@@ -540,3 +542,69 @@ class ThirdRun(unittest.TestCase):
         # unchanged head: nothing to say
         out = json.loads(self.run_status(p, pr_args=[108], approved_heads=["108=9eb2543"]))
         self.assertNotIn("head_changed", out["queue"][0])
+
+
+
+class FourthRun(unittest.TestCase):
+    """Fourth live run (uliveto): 2 of 4 merged, plus seven findings."""
+
+    run_status = FieldTest.run_status
+
+    def test_heads_split_inside_one_argument(self):
+        # zsh passes an unquoted $HEADS as ONE argument
+        self.assertEqual(mq.parse_heads(["651=0505fb8 655=8298B6D,658=59ee43f"]),
+                         {651: "0505fb8", 655: "8298b6d", 658: "59ee43f"})
+        self.assertEqual(mq.parse_heads(["651=0505fb8", "655=8298b6d"]), {651: "0505fb8", 655: "8298b6d"})
+
+    def test_bad_heads_are_an_error_not_a_skipped_check(self):
+        for bad in (["651"], ["651=xyz!"], ["abc=0505fb8"], ["651=0505fb8 655"]):
+            with self.assertRaises(mq.UsageError, msg=bad):
+                mq.parse_heads(bad)
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(mq.main(["status", "--repo", "o/r", "--approved-heads", "651=nothex"]), 3)
+        self.assertIn("bad entry", buf.getvalue())
+
+    def test_missing_heads_are_reported(self):
+        import json
+        p = [pr(number=651, headRefOid="0505fb8aa", reviews=conn(review(GREEN))),
+             pr(number=655, headRefOid="8298b6daa", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[651, 655], approved_heads=["651=0505fb8"]))
+        self.assertIn("#655: their head was NOT checked", " ".join(out["notes"]))
+
+    def test_compare_failure_is_unverified_not_force_push(self):
+        import json
+        p = [pr(number=651, headRefOid="1111111aa", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[651], approved_heads=["651=0505fb8"]))  # compare -> 404
+        r = out["queue"][0]
+        self.assertEqual(r["head_changed"]["kind"], "unverified")
+        self.assertEqual(r["next"], "skip")
+        self.assertIn("can't verify", " ".join(r["blockers"]))
+        self.assertNotIn("force", " ".join(r["blockers"]))
+
+    def test_stacked_warning_survives_pr_filter(self):
+        import json
+        p = [pr(number=651, headRefName="av/finanza", reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, pr_args=[651], open_bases=[(651, "main"), (652, "av/finanza"), (653, "av/finanza")]))
+        self.assertEqual(out["queue"][0]["dependents"], [652, 653])
+        w = " ".join(out["queue"][0]["warnings"])
+        self.assertIn("can conflict", w)
+        self.assertNotIn("usually", w)
+
+    def test_other_rules_and_copilot_ruleset(self):
+        import json
+        payload = [
+            {"type": "pull_request", "parameters": {"required_approving_review_count": 0, "require_code_owner_review": True,
+                                                    "require_extra_approval_for_unattributed_changes": True,
+                                                    "dismiss_stale_reviews_on_push": False}},
+            {"type": "code_quality", "parameters": {}},
+            {"type": "copilot_code_review", "parameters": {"review_on_push": True}},
+        ]
+        p = [pr(number=651, reviews=conn(review(GREEN)))]
+        out = json.loads(self.run_status(p, rules_payload=payload))
+        self.assertEqual(out["rules"]["other"], ["code_quality", "pull_request.require_extra_approval_for_unattributed_changes"])
+        self.assertEqual(out["rules"]["copilot_review"], {"review_on_push": True, "review_drafts": False})
+        text = self.run_status(p, fmt="brief", rules_payload=payload)
+        self.assertIn("Other branch rules", text)
+        self.assertIn("re-reviews after every push", text)

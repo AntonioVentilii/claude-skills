@@ -181,6 +181,30 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """ % PR_FIELDS
 
+OPEN_BASES_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number baseRefName }
+    }
+  }
+}
+"""
+
+
+def open_pr_bases(repo: str) -> list[tuple[int, str]]:
+    owner, name = repo.split("/", 1)
+    out, cursor = [], None
+    while True:
+        d = graphql(OPEN_BASES_QUERY, owner=owner, name=name, cursor=cursor)
+        conn_ = d["repository"]["pullRequests"]
+        out += [(n["number"], n["baseRefName"]) for n in conn_["nodes"]]
+        if not conn_["pageInfo"]["hasNextPage"]:
+            return out
+        cursor = conn_["pageInfo"]["endCursor"]
+
+
 HISTORY_QUERY = """
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
@@ -246,7 +270,11 @@ def fetch_rules(repo: str, base: str) -> dict:
         "required_approvals": 0, "code_owner_review": False, "thread_resolution": False,
         "strict_up_to_date": False, "required_checks": [], "linear_history": False,
         "allowed_methods": None, "merge_queue": False, "sources": [],
+        "copilot_review": None,  # ruleset that has GitHub request Copilot reviews
+        "other": [],  # rules GitHub enforces that the queue doesn't model itself
     }
+    known_pr_params = {"required_approving_review_count", "require_code_owner_review",
+                       "required_review_thread_resolution", "allowed_merge_methods"}
     ok, data = rest(f"repos/{repo}/rules/branches/{base}?per_page=100")
     if ok and isinstance(data, list):
         if data:
@@ -257,6 +285,9 @@ def fetch_rules(repo: str, base: str) -> dict:
                 rules["required_approvals"] = max(rules["required_approvals"], p.get("required_approving_review_count", 0) or 0)
                 rules["code_owner_review"] |= bool(p.get("require_code_owner_review"))
                 rules["thread_resolution"] |= bool(p.get("required_review_thread_resolution"))
+                for k, v in p.items():
+                    if k not in known_pr_params and v not in (None, False, 0, [], ""):
+                        rules["other"].append(f"pull_request.{k}" + ("" if v is True else f"={v}"))
                 am = p.get("allowed_merge_methods")
                 if am:
                     cur = set(am)
@@ -268,6 +299,11 @@ def fetch_rules(repo: str, base: str) -> dict:
                 rules["linear_history"] = True
             elif t == "merge_queue":
                 rules["merge_queue"] = True
+            elif t == "copilot_code_review":
+                rules["copilot_review"] = {"review_on_push": bool(p.get("review_on_push")),
+                                           "review_drafts": bool(p.get("review_draft_pull_requests"))}
+            elif t:
+                rules["other"].append(t)
     ok, prot = rest(f"repos/{repo}/branches/{base}/protection")
     if ok and isinstance(prot, dict):
         rules["sources"].append("branch-protection")
@@ -280,6 +316,7 @@ def fetch_rules(repo: str, base: str) -> dict:
         rules["thread_resolution"] |= bool((prot.get("required_conversation_resolution") or {}).get("enabled"))
         rules["linear_history"] |= bool((prot.get("required_linear_history") or {}).get("enabled"))
     rules["required_checks"] = sorted({c for c in rules["required_checks"] if c})
+    rules["other"] = sorted(set(rules["other"]))
     if rules["allowed_methods"] is not None:
         rules["allowed_methods"] = sorted(rules["allowed_methods"])  # JSON-safe
     return rules
@@ -596,7 +633,7 @@ def eval_approvals(pr: dict, rules: dict) -> dict:
         return {"ok": True, "detail": "approved by " + ", ".join("@" + a for a in approvers) if approvers else "approved"}
     detail = "GitHub requires no approval for this PR"
     if rules.get("code_owner_review"):
-        detail += " (the code-owner rule exists but doesn't apply here, e.g. you own the files changed)"
+        detail += " (the code-owner rule exists but GitHub doesn't apply it here: no CODEOWNERS file, or you own the files changed)"
     if approvers:
         detail += f"; {len(approvers)} approval(s) anyway"
     return {"ok": True, "detail": detail}
@@ -748,7 +785,7 @@ def classify_head_change(compare: dict, base: str) -> dict:
     e.g. someone pressed Update branch), or {"kind": "new_commits", "commits":
     [headline, ...]} (new work nobody approved)."""
     if compare.get("status") not in ("ahead", "identical"):
-        return {"kind": "rewritten"}
+        return {"kind": "rewritten", "status": compare.get("status")}
     pat = re.compile(MERGE_OF_BASE.format(base=re.escape(base)))
     new, merges = [], 0
     for c in compare.get("commits") or []:
@@ -769,8 +806,11 @@ def apply_head_change(r: dict, approved: str, change: dict) -> None:
         r["warnings"].append(f"head changed since the briefing ({approved[:7]} → {(r['head_sha'] or '')[:7]}): "
                              f"only {change['count']} merge(s) of the base, OK")
         return
-    if change["kind"] == "rewritten":
-        why = f"branch rewritten since the briefing (was {approved[:7]}, force-pushed)"
+    if change["kind"] == "unverified":
+        why = (f"can't verify the head against the briefing (comparing {approved[:7]}...{(r['head_sha'] or '')[:7]}"
+               f" failed: {change.get('error', '?')})")
+    elif change["kind"] == "rewritten":
+        why = f"branch rewritten since the briefing (was {approved[:7]}, now {change.get('status') or 'diverged'})"
     else:
         why = (f"{len(change['commits'])} new commit(s) pushed since the briefing: "
                + "; ".join(change["commits"][:3]) + ("…" if len(change["commits"]) > 3 else ""))
@@ -811,16 +851,30 @@ def apply_cli_overrides(cfg: dict, a) -> dict:
     return cfg
 
 
+class UsageError(Exception):
+    pass
+
+
 def parse_heads(items) -> dict[int, str]:
-    out = {}
+    """`N=SHA` pairs. Each argument may hold several pairs separated by spaces
+    or commas: zsh doesn't split an unquoted $HEADS, so `--approved-heads
+    $HEADS` arrives as ONE argument there. Anything malformed is an error,
+    never silently ignored: a skipped check is worse than a failed command."""
+    out: dict[int, str] = {}
     for it in items or []:
-        n, _, sha = it.partition("=")
-        if n.strip().lstrip("#").isdigit() and sha.strip():
-            out[int(n.strip().lstrip("#"))] = sha.strip()
+        for tok in re.split(r"[\s,]+", it.strip()):
+            if not tok:
+                continue
+            n, eq, sha = tok.partition("=")
+            n = n.strip().lstrip("#")
+            if not eq or not n.isdigit() or not re.fullmatch(r"[0-9a-fA-F]{4,40}", sha.strip()):
+                raise UsageError(f"--approved-heads: bad entry {tok!r}, expected N=SHA (hex)")
+            out[int(n)] = sha.strip().lower()
     return out
 
 
 def cmd_status(a) -> int:
+    approved = parse_heads(getattr(a, "approved_heads", None))  # validate before any network call
     repo = a.repo or current_repo()
     cfg = apply_cli_overrides(load_config(repo), a)
     meta, prs, viewer = fetch_repo(repo, a.pr)
@@ -834,7 +888,7 @@ def cmd_status(a) -> int:
                 break
             time.sleep(delay)
             pr = prs[i] = fetch_one(repo, pr["number"])
-    uses = cfg.get("copilot") == "auto" and repo_uses_copilot(repo, prs)
+    uses = cfg.get("copilot") == "auto" and (bool(rules.get("copilot_review")) or repo_uses_copilot(repo, prs))
     method, method_note = choose_method(meta, rules, cfg.get("method", "squash"))
     ctx = {"cfg": cfg, "viewer": viewer, "base": base, "rules": rules, "repo_uses_copilot": uses, "merge_method": method,
            "explicit": bool(a.pr), "behind": {}, "confirmed": set(a.confirmed or [])}
@@ -850,31 +904,50 @@ def cmd_status(a) -> int:
 
     # Heads the user approved in the briefing: anything else pushed since
     # (other than merges of the base) is not what they said go to.
-    approved = parse_heads(getattr(a, "approved_heads", None))
+    unchecked = []
     for r in results:
+        if r["next"] == "excluded":
+            continue
         want = approved.get(r["number"])
-        if not want or r["next"] == "excluded" or (r["head_sha"] or "").startswith(want):
+        if not want:
+            if approved:
+                unchecked.append(r["number"])
+            continue
+        if (r["head_sha"] or "").lower().startswith(want):
             continue
         ok, cmp_ = rest(f"repos/{repo}/compare/{want}...{r['head_sha']}")
-        change = classify_head_change(cmp_, base) if ok and isinstance(cmp_, dict) else {"kind": "rewritten"}
+        if ok and isinstance(cmp_, dict):
+            change = classify_head_change(cmp_, base)
+        else:
+            change = {"kind": "unverified", "error": str(cmp_).strip().splitlines()[0][:160] if cmp_ else "no response"}
         apply_head_change(r, want, change)
 
     # Stacked PRs: a queued PR whose head branch is the base of other open PRs.
     # Merging it makes GitHub retarget them to the default branch (when the
     # head branch is deleted on merge), carrying its original commits.
     by_base: dict[str, list[int]] = {}
-    for pr in prs:
-        by_base.setdefault(pr.get("baseRefName") or "", []).append(pr["number"])
+    bases = [(pr["number"], pr.get("baseRefName")) for pr in prs]
+    if a.pr:  # --pr fetched only some PRs: stacked ones are among the others
+        try:
+            bases = open_pr_bases(repo)
+        except GhError:
+            pass
+    for n, b in bases:
+        by_base.setdefault(b or "", []).append(n)
     for r in results:
         deps = sorted(n for n in by_base.get(r["head"] or "", []) if n != r["number"])
         if r["next"] != "excluded" and deps:
             r["dependents"] = deps
             r["warnings"].append(
                 "base of open PR(s) " + ", ".join(f"#{n}" for n in deps) + ": merging it retargets them to "
-                f"`{base}` (if its branch is deleted on merge) with its original commits; they are NOT part of this run")
+                f"`{base}` (if its branch is deleted on merge), still carrying its original commits, which can "
+                "conflict after a squash; they are NOT part of this run")
 
     perm = meta.get("viewerPermission")
     notes = []
+    if unchecked:
+        notes.append("no approved head given for " + ", ".join(f"#{n}" for n in unchecked)
+                     + ": their head was NOT checked against the briefing")
     if perm not in ("WRITE", "MAINTAIN", "ADMIN"):
         notes.append(f"viewer permission is {perm}: you cannot update or merge here")
     if rules.get("merge_queue"):
@@ -983,6 +1056,10 @@ def print_brief(out: dict) -> None:
         copilot = "ignored in this repo"
     else:
         used = "required" if cp_mode == "required" else ("used in this repo" if out["repo_uses_copilot"] else "not used in this repo, so not checked")
+        crv = (out.get("rules") or {}).get("copilot_review")
+        if crv and cp_mode != "off":
+            used += (" (a branch rule has GitHub request it" + ("; it re-reviews after every push" if crv["review_on_push"]
+                     else "; it doesn't re-review after a push") + ")")
         copilot = used
     rules = out["rules"]
     print(f"## Merge queue: {out['repo']}\n")
@@ -1012,6 +1089,9 @@ def print_brief(out: dict) -> None:
     if rules.get("required_checks"):
         req.append("required checks: " + ", ".join(rules["required_checks"]))
     print("- **Branch rules found:** " + ("; ".join(req) if req else "none (nothing enforced by GitHub, the queue's own gates still apply)") + ".")
+    if rules.get("other"):
+        print("- **Other branch rules** (GitHub enforces them; the queue doesn't check them itself, a merge they block"
+              " shows up as \"not merged\"): " + ", ".join(f"`{x}`" for x in rules["other"]) + ".")
     for n in out["notes"]:
         print(f"- **Note:** {n}")
     print("\n### Gates (a PR that fails any of them is skipped, never fixed)")
@@ -1061,7 +1141,7 @@ def print_brief(out: dict) -> None:
         for r in deps:
             print(f"- Merging #{r['number']} moves " + ", ".join(f"#{n}" for n in r["dependents"])
                   + f" onto `{out['base']}` (if its branch is deleted on merge), still carrying #{r['number']}'s original"
-                  " commits, which usually means conflicts after a squash. They stay out of this run.")
+                  " commits, which can conflict after a squash. They stay out of this run.")
     if asks:
         print("\nReply to go ahead, and say which of the Copilot reviews above are resolved.")
     else:
@@ -1172,7 +1252,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     try:
         return a.fn(a)
-    except GhError as e:
+    except (GhError, UsageError) as e:
         print(json.dumps({"error": str(e)}))
         return 3
 

@@ -70,8 +70,9 @@ python3 SKILL/scripts/mq.py status [flags]                  # JSON you act on
 
 The `brief` output is a schematic summary: the settings in force (which PRs,
 order, Copilot, update, merge method, branch rules found), the gates, and a
-table with the plan for each PR. **Present it to the user in their language**,
-keeping it schematic and plain. Someone who doesn't know GitHub internals
+table with the plan for each PR. The script prints it in English: **translate
+every line, headings and table included, into the user's language** before
+showing it, keeping it schematic and plain. Someone who doesn't know GitHub internals
 should understand what will happen. Don't add prose around it.
 
 Then **stop and wait for the user's go-ahead.** Nothing is changed before it.
@@ -99,8 +100,12 @@ in the report as "appeared during the run, not processed".
 
 **Approved heads.** The go-ahead also covers each PR's content as it was in
 the briefing. Write down each PR's `head_sha` from the JSON
-(`HEADS="102=64ad16b 103=…"`) and pass `--approved-heads $HEADS` to every
-later `status` call. If someone else pushes to a PR during the run:
+and pass them to every later `status` call as separate `N=SHA` arguments,
+written out (`--approved-heads 102=64ad16b 103=8298b6d`), or as one quoted
+string (`--approved-heads "$HEADS"`). Never pass an unquoted `$HEADS`: zsh,
+the default shell on macOS, doesn't split it. The script now rejects anything
+malformed, and lists under `notes` any approved PR it had no head for: if
+that note appears, the check didn't run for that PR, so fix the command. If someone else pushes to a PR during the run:
 - if the push is only a merge of the base (someone pressed Update branch), the
   run continues, with a warning that goes in the report;
 - if it adds new commits, or rewrites the branch, the PR is skipped as "not
@@ -112,7 +117,7 @@ that `wait-checks` reports, so your own merge commit isn't flagged.
 **Stacked PRs.** When a queued PR is the base of other open PRs, the briefing
 lists them under "Stacked PRs": merging it makes GitHub retarget them to the
 default branch (when the branch is deleted on merge), still carrying the
-original commits, which usually conflicts after a squash. Say this plainly; the
+original commits, which can conflict after a squash. Say this plainly; the
 user may prefer to merge differently.
 
 **Dry run:** the briefing is the whole output. Make no changes of any kind.
@@ -143,7 +148,12 @@ In order, for each PR. Any failure → `next: skip` with the reason in `blockers
    whether code owners must approve. An outstanding *changes requested* from a
    human blocks too, even if no rule enforces it. Unresolved non-Copilot
    threads block only when the rules require conversation resolution;
-   otherwise they become a warning.
+   otherwise they become a warning. Branch rules the script doesn't model
+   (e.g. `code_quality`, extra-approval or stale-review parameters) are listed
+   in the briefing as "Other branch rules": GitHub still enforces them, so a
+   merge they block shows up as "not merged" in step e. A `copilot_code_review`
+   rule tells the script the repo uses Copilot, and whether Copilot re-reviews
+   after every push.
 5. **No conflicts** with the default branch. Only `MERGEABLE` passes: while
    GitHub is still computing it (`UNKNOWN`) the script retries a few times,
    then skips with "re-run shortly".
@@ -175,7 +185,7 @@ of guessing.
 
 Process the approved queue in order. Keep a running log per PR (result +
 reason) for the report. **Re-run `mq.py status --pr N [--confirmed …]
---approved-heads $HEADS` right
+--approved-heads <N=SHA …>` right
 before acting on each PR**, because merging the previous PR moved the base, and
 act on that fresh `next`:
 
@@ -193,7 +203,7 @@ gh pr update-branch N                   # add --rebase only when update_method i
 python3 SKILL/scripts/mq.py wait-checks --pr N --not-sha $OLD --timeout-sec 540
 #    (no --not-sha when there was no update)
 # c. re-verify everything on the final head
-python3 SKILL/scripts/mq.py status --pr N [--confirmed N] --approved-heads $HEADS
+python3 SKILL/scripts/mq.py status --pr N [--confirmed N] --approved-heads N=<approved sha>
 # d. merge: --<merge_method> from the snapshot (--squash | --merge | --rebase).
 #    Direct merge by default; add --auto only when merge_mode is "auto".
 gh pr merge N --<merge_method> --match-head-commit <head_sha>
